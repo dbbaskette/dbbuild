@@ -189,7 +189,8 @@ setup_gitignore
 print_message "$COLOR_BLUE" "$ICON_TAG" "Handling versioning..."
 get_current_version() {
   if [ -f "pom.xml" ]; then
-    grep '<version>' pom.xml | head -n1 | sed -e 's/.*<version>//' -e 's/.*<version>//'
+    # Correctly parse the version from pom.xml, stripping tags and whitespace.
+    grep '<version>' pom.xml | head -n1 | sed -e 's/^[[:space:]]*<version>//' -e 's/}<\/version>.*//'
   elif [ -f "VERSION" ]; then
     cat VERSION
   else
@@ -200,8 +201,7 @@ CURRENT_VERSION=$(get_current_version)
 print_message "$COLOR_CYAN" "$ICON_INFO" "Current version: ${CURRENT_VERSION}"
 
 if [ -z "$BUMP_TYPE" ]; then
-    if git rev-parse --verify HEAD >/dev/null 2>&1;
-    then
+    if git rev-parse --verify HEAD >/dev/null 2>&1; then
         COMMIT_COUNT=$(git rev-list --count HEAD...$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD))
     else
         COMMIT_COUNT=0
@@ -253,11 +253,16 @@ if [ "$BUMP_TYPE" != "keep" ]; then
   update_version() {
     local version_to_set=$1
     if [ -f "pom.xml" ]; then
-      # This sed command is designed to replace the *first* <version> tag in a pom.xml,
-      # which is conventionally the main project version. It is not guaranteed to work
-      # on unconventional or multi-module POM structures.
-      sed -i.bak "0,/<version>/{s/<version>.*<\/version>/<version>${version_to_set}<\/version>/}" pom.xml && rm pom.xml.bak
-      print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Updated version in pom.xml to ${version_to_set}"
+        if ! command_exists mvn; then
+            print_message "$COLOR_RED" "$ICON_ERROR" "Maven (mvn) is not installed, but a pom.xml was found. Cannot update version."
+            exit 1
+        fi
+        print_message "$COLOR_CYAN" "$ICON_INFO" "Using Maven to update version in all modules..."
+        if ! mvn versions:set -DnewVersion="$version_to_set" -DprocessAllModules=true -DgenerateBackupPoms=false; then
+            print_message "$COLOR_RED" "$ICON_ERROR" "Maven versions:set command failed."
+            exit 1
+        fi
+        print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Successfully updated version in all pom.xml files to ${version_to_set}."
     elif [ -f "VERSION" ]; then
       echo "$version_to_set" > VERSION
       print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Updated version in VERSION to ${version_to_set}"
@@ -276,13 +281,12 @@ if [ "$NO_BUILD" = true ]; then
     print_message "$COLOR_YELLOW" "$ICON_INFO" "Skipping build step due to --no-build flag."
 elif [ -f "pom.xml" ]; then
     if [ "$AUTO_YES" = true ] || prompt_yes_no "Build project with Maven?"; then
-        print_message "$COLOR_CYAN" "$ICON_INFO" "Building Java project with Maven..."
+        print_message "$COLOR_CYAN" "$ICON_INFO" "Building project with Maven..."
         if ! mvn clean install; then
             print_message "$COLOR_RED" "$ICON_ERROR" "Maven build failed. Aborting."
             exit 1
         fi
         print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Maven build successful."
-        BUILT_JAR_PATH=$(find ./target -name "*.jar" 2>/dev/null | head -n 1)
     else
         print_message "$COLOR_YELLOW" "$ICON_INFO" "Build skipped by user."
     fi
@@ -294,16 +298,42 @@ update_cf_manifest() {
     local manifest_file=""
     if [ -f "manifest.yml" ]; then manifest_file="manifest.yml"; fi
     if [ -f "manifest.yaml" ]; then manifest_file="manifest.yaml"; fi
+    if [ -z "$manifest_file" ]; then return; fi
     
-    if [ -n "$manifest_file" ] && [ -n "$BUILT_JAR_PATH" ]; then
-        print_message "$COLOR_BLUE" "$ICON_CF" "Updating Cloud Foundry manifest..."
-        if ! grep -q "path:" "$manifest_file"; then
-            print_message "$COLOR_YELLOW" "$ICON_WARNING" "No 'path' attribute found in $manifest_file. Skipping update."
-            return
-        fi
-        # Use sed to replace the path, preserving indentation.
-        sed -i.bak "s|^\[[:space:]]*path:\]\(.*\)|\1 ${BUILT_JAR_PATH}|" "$manifest_file" && rm "${manifest_file}.bak"
-        print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Updated '$manifest_file' to point to $BUILT_JAR_PATH."
+    print_message "$COLOR_BLUE" "$ICON_CF" "Found Cloud Foundry manifest: $manifest_file"
+    
+    # Find the most relevant JAR file. Prioritize JARs in the same directory as the manifest.
+    local manifest_dir
+    manifest_dir=$(dirname "$manifest_file")
+    local search_path="${manifest_dir}/target"
+    
+    print_message "$COLOR_CYAN" "$ICON_INFO" "Searching for JAR in '$search_path'..."
+    BUILT_JAR_PATH=$(find "$search_path" -name "*.jar" 2>/dev/null | head -n 1)
+
+    if [ -z "$BUILT_JAR_PATH" ]; then
+        print_message "$COLOR_YELLOW" "$ICON_WARNING" "No JAR found in '$search_path'. Searching all target directories..."
+        BUILT_JAR_PATH=$(find . -path "*/target/*.jar" 2>/dev/null | head -n 1)
+    fi
+
+    if [ -z "$BUILT_JAR_PATH" ]; then
+        print_message "$COLOR_RED" "$ICON_ERROR" "No built JAR file found. Cannot update manifest."
+        return
+    fi
+    
+    print_message "$COLOR_CYAN" "$ICON_INFO" "Found artifact to use: $BUILT_JAR_PATH"
+
+    if ! grep -q "path:" "$manifest_file"; then
+        print_message "$COLOR_YELLOW" "$ICON_WARNING" "No 'path' attribute found in $manifest_file. Skipping update."
+        return
+    fi
+    
+    print_message "$COLOR_CYAN" "$ICON_INFO" "Attempting to update manifest path..."
+    sed -i.bak "s|^\[[:space:]]*path:\).*|\1 ${BUILT_JAR_PATH}|" "$manifest_file" && rm "${manifest_file}.bak"
+    
+    if [[ $(git status --porcelain "$manifest_file") ]]; then
+        print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Successfully modified $manifest_file."
+    else
+        print_message "$COLOR_RED" "$ICON_ERROR" "Failed to modify $manifest_file. The path may have already been correct."
     fi
 }
 update_cf_manifest
@@ -319,8 +349,7 @@ scan_for_secrets() {
       return 0
   fi
   local keyword_pattern='(password|secret|token|apikey|private_key)'
-  # Ignore assignments to variables or placeholders like <password> or ${VAR}
-  local safe_assignment_pattern='(=\s*(\$|\{\{<%|env\(|<)|:\s*(\$|\{\{|<))'
+  local safe_assignment_pattern='(=\s*(\$|\{\{<%|env\(|<))|:\s*(\$|\{\{|<))'
   local all_findings=""
   for file in $staged_files; do
     if ! [[ $(file -b --mime-type "$file") == text/* ]]; then continue; fi
@@ -391,8 +420,7 @@ else
            gh auth login
         fi
     fi
-    if gh auth status > /dev/null 2>&1;
-    then
+    if gh auth status > /dev/null 2>&1; then
         if [ "$AUTO_YES" = true ] || prompt_yes_no "Create a pull request?"; then
             print_message "$COLOR_CYAN" "$ICON_PULL_REQUEST" "Creating pull request..."
             gh pr create --fill --web
@@ -401,11 +429,15 @@ else
             print_message "$COLOR_CYAN" "$ICON_RELEASE" "Creating GitHub release..."
             RELEASE_ARGS=("$TAG_NAME" --title "Release ${NEW_VERSION}" --notes "Release version ${NEW_VERSION}")
             if [ "$NO_JAR" = false ]; then
+                # Re-find the JAR path in case the build was skipped earlier but a JAR exists.
+                if [ -z "$BUILT_JAR_PATH" ]; then
+                    BUILT_JAR_PATH=$(find . -path "*/target/*.jar" 2>/dev/null | head -n 1)
+                fi
                 if [ -n "$BUILT_JAR_PATH" ]; then
                     RELEASE_ARGS+=("$BUILT_JAR_PATH")
                     print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Found JAR file to attach: $BUILT_JAR_PATH"
                 else
-                    print_message "$COLOR_YELLOW" "$ICON_WARNING" "No JAR file found in ./target to attach."
+                    print_message "$COLOR_YELLOW" "$ICON_WARNING" "No JAR file found to attach."
                 fi
             else
                 print_message "$COLOR_YELLOW" "$ICON_INFO" "Skipping JAR attachment due to --no-jar flag."

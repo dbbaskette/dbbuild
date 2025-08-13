@@ -1,0 +1,281 @@
+#!/bin/bash
+
+# ==============================================================================
+#
+#          dbplan - Convert PROJECT/DEVPLAN phases into GitHub feature issues
+#
+# ==============================================================================
+
+set -euo pipefail
+
+# ----------------------------- Configuration ---------------------------------
+COLOR_RESET='\e[0m'
+COLOR_RED='\e[0;31m'
+COLOR_GREEN='\e[0;32m'
+COLOR_YELLOW='\e[0;33m'
+COLOR_BLUE='\e[0;34m'
+COLOR_CYAN='\e[0;36m'
+
+ICON_INFO="ℹ️"
+ICON_SUCCESS="✅"
+ICON_WARNING="⚠️"
+ICON_ERROR="❌"
+ICON_GH="🐙"
+
+DEFAULT_LABEL="feature"
+
+# ------------------------------ Utilities ------------------------------------
+print_msg() { # color icon message
+  local color="$1"; shift
+  local icon="$1"; shift
+  printf "%b %s%b\n" "${color}${icon}" "$*" "${COLOR_RESET}"
+}
+
+die() {
+  print_msg "$COLOR_RED" "$ICON_ERROR" "$*"
+  exit 1
+}
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+hash_phase_id() { # input: file path + phase title -> short stable id
+  local input="$1"
+  if command_exists shasum; then
+    printf "%s" "$input" | shasum -a 256 | cut -c1-16
+  elif command_exists sha256sum; then
+    printf "%s" "$input" | sha256sum | cut -c1-16
+  else
+    # poor-man fallback
+    printf "%s" "$input" | md5 2>/dev/null | cut -c1-16 || true
+  fi
+}
+
+ensure_label_exists() {
+  local repo="$1"; shift
+  local label_name="$1"
+  # Check existing labels
+  if ! gh label list --repo "$repo" --json name | grep -q "\"${label_name}\""; then
+    print_msg "$COLOR_YELLOW" "$ICON_INFO" "Creating missing label '${label_name}' in ${repo}"
+    # Default blue color; description generic
+    gh label create "$label_name" --repo "$repo" --color "1D76DB" --description "Feature work" >/dev/null 2>&1 || true
+  fi
+}
+
+get_repo() {
+  # Uses gh to infer repo from current git remote
+  gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true
+}
+
+usage() {
+  cat <<EOF
+Usage: dbplan [--file PATH] [--label NAME] [--dry-run] [--update-closed] [--repo OWNER/NAME] [--verbose]
+
+Parses a dev plan section from PROJECT.md/DEVPLAN.md and creates/updates GitHub issues (one per phase).
+
+Options:
+  --file PATH          Path to plan file. Defaults to DEVPLAN.md, then PROJECT.md
+  --label NAME         Label to apply to created issues (default: ${DEFAULT_LABEL})
+  --repo OWNER/NAME    Target GitHub repo. Defaults to current directory's repo via gh
+  --dry-run            Print actions without calling GitHub
+  --update-closed      Allow updates to closed issues (default: skip closed)
+  --verbose            Verbose logging
+  --help               Show this help
+
+The plan section must be enclosed by markers:
+  <!-- devplan:start -->
+  ... phases & tasks ...
+  <!-- devplan:end -->
+
+Phase heading format:
+  ## Phase: Title Here
+Tasks (markdown checkboxes):
+  - [ ] Task description
+  - [x] Optional completed task
+EOF
+}
+
+# --------------------------- Argument parsing --------------------------------
+PLAN_FILE=""
+LABEL_NAME="${DEFAULT_LABEL}"
+REPO_OVERRIDE=""
+DRY_RUN=false
+UPDATE_CLOSED=false
+VERBOSE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --file) PLAN_FILE="$2"; shift 2 ;;
+    --label) LABEL_NAME="$2"; shift 2 ;;
+    --repo) REPO_OVERRIDE="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --update-closed) UPDATE_CLOSED=true; shift ;;
+    --verbose) VERBOSE=true; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+# ------------------------------ Preconditions --------------------------------
+command_exists gh || die "GitHub CLI (gh) is required"
+command_exists git || die "git is required"
+command_exists jq || die "jq is required"
+
+if [[ -z "${PLAN_FILE}" ]]; then
+  if [[ -f "DEVPLAN.md" ]]; then PLAN_FILE="DEVPLAN.md"; 
+  elif [[ -f "PROJECT.md" ]]; then PLAN_FILE="PROJECT.md"; 
+  else
+    die "No plan file found. Provide --file or add DEVPLAN.md/PROJECT.md"
+  fi
+fi
+
+[[ -f "${PLAN_FILE}" ]] || die "Plan file not found: ${PLAN_FILE}"
+
+REPO_NAME="${REPO_OVERRIDE}"
+if [[ -z "${REPO_NAME}" ]]; then
+  REPO_NAME=$(get_repo)
+  [[ -n "${REPO_NAME}" ]] || die "Unable to detect repo. Ensure you're in a GitHub repo (gh auth + git remote). Or pass --repo"
+fi
+
+${VERBOSE} && print_msg "$COLOR_CYAN" "$ICON_GH" "Repo: ${REPO_NAME}"
+${VERBOSE} && print_msg "$COLOR_CYAN" "$ICON_INFO" "Plan file: ${PLAN_FILE}"
+
+# Ensure label exists (best-effort)
+ensure_label_exists "$REPO_NAME" "$LABEL_NAME"
+
+# ------------------------------ Parse section --------------------------------
+PLAN_SECTION=$(awk '/<!--[[:space:]]*devplan:start[[:space:]]*-->/{flag=1;next} /<!--[[:space:]]*devplan:end[[:space:]]*-->/{flag=0} flag' "$PLAN_FILE")
+
+if [[ -z "$PLAN_SECTION" ]]; then
+  die "No devplan section found between markers in ${PLAN_FILE}"
+fi
+
+# --------------------------- Extract phases/tasks -----------------------------
+TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t dbplan)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+current_phase_title=""
+current_tasks_file=""
+declare -a PHASE_TITLES=()
+declare -a PHASE_TASK_FILES=()
+
+while IFS= read -r line; do
+  if [[ "$line" =~ ^\#\#[[:space:]]*Phase:[[:space:]]*(.+)$ ]]; then
+    # flush previous phase if any
+    if [[ -n "$current_phase_title" ]]; then
+      PHASE_TITLES+=("$current_phase_title")
+      PHASE_TASK_FILES+=("$current_tasks_file")
+    fi
+    current_phase_title="${BASH_REMATCH[1]}"
+    current_tasks_file="${TMP_DIR}/tasks_$(printf "%s" "$current_phase_title" | tr ' ' '_' | tr -cd '[:alnum:]_').md"
+    : > "$current_tasks_file"
+  else
+    # capture checkbox lines under an active phase
+    if [[ -n "$current_phase_title" ]]; then
+      if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*\[[xX[:space:]]\][[:space:]].*$ ]]; then
+        printf "%s\n" "$line" >> "$current_tasks_file"
+      fi
+    fi
+  fi
+done <<< "$PLAN_SECTION"
+
+# flush last phase
+if [[ -n "$current_phase_title" ]]; then
+  PHASE_TITLES+=("$current_phase_title")
+  PHASE_TASK_FILES+=("$current_tasks_file")
+fi
+
+[[ ${#PHASE_TITLES[@]} -gt 0 ]] || die "No phases found. Ensure lines like: '## Phase: Title' and checkbox tasks under them."
+
+# ------------------------------- Issue sync ----------------------------------
+create_or_update_issue() {
+  local repo="$1"; shift
+  local phase_title="$1"; shift
+  local tasks_file="$1"; shift
+
+  local phase_id
+  phase_id=$(hash_phase_id "${PLAN_FILE}:${phase_title}")
+  local issue_title="Feature: ${phase_title}"
+
+  # Build body
+  local body_file
+  body_file="${TMP_DIR}/body_$(printf "%s" "$phase_title" | tr ' ' '_' | tr -cd '[:alnum:]_').md"
+  {
+    printf "## Phase: %s\n\n" "$phase_title"
+    printf "### Tasks\n"
+    if [[ -s "$tasks_file" ]]; then
+      cat "$tasks_file"
+    else
+      printf "- [ ] (no tasks listed)\n"
+    fi
+    printf "\n<!-- plan-source: %s; phase-id: %s -->\n" "$PLAN_FILE" "$phase_id"
+  } > "$body_file"
+
+  ${VERBOSE} && print_msg "$COLOR_BLUE" "$ICON_INFO" "Searching for existing issue by marker: ${phase_id}"
+
+  # Search by hidden marker in body
+  local existing_json
+  existing_json=$(gh issue list --repo "$repo" --limit 200 --search "in:body \"${phase_id}\"" --json number,title,state 2>/dev/null || true)
+
+  local issue_number=""
+  if echo "$existing_json" | grep -q '"number"'; then
+    issue_number=$(echo "$existing_json" | jq -r '.[0].number' 2>/dev/null || true)
+  fi
+
+  # Fallback: search by title if marker not found
+  if [[ -z "$issue_number" ]]; then
+    existing_json=$(gh issue list --repo "$repo" --limit 200 --search "in:title \"${issue_title}\"" --json number,title,state 2>/dev/null || true)
+    if echo "$existing_json" | grep -q '"number"'; then
+      issue_number=$(echo "$existing_json" | jq -r '.[0].number' 2>/dev/null || true)
+    fi
+  fi
+
+  if [[ -z "$issue_number" ]]; then
+    if $DRY_RUN; then
+      print_msg "$COLOR_GREEN" "$ICON_SUCCESS" "[dry-run] Would create issue: '${issue_title}' with label '${LABEL_NAME}'"
+    else
+      print_msg "$COLOR_GREEN" "$ICON_SUCCESS" "Creating issue: ${issue_title}"
+      gh issue create --repo "$repo" --title "$issue_title" --label "$LABEL_NAME" --body-file "$body_file" >/dev/null
+    fi
+    return 0
+  fi
+
+  # Issue exists; maybe update
+  local state
+  state=$(echo "$existing_json" | jq -r '.[0].state' 2>/dev/null || echo "OPEN")
+  if [[ "$state" != "OPEN" && "$UPDATE_CLOSED" != true ]]; then
+    print_msg "$COLOR_YELLOW" "$ICON_WARNING" "Skipping closed issue #${issue_number} (${issue_title}). Use --update-closed to modify."
+    return 0
+  fi
+
+  # Compare body contents
+  local current_body
+  current_body=$(gh issue view "$issue_number" --repo "$repo" --json body -q .body)
+
+  # Normalize whitespace for comparison
+  local new_body_norm cur_body_norm
+  new_body_norm=$(tr -d '\r' < "$body_file")
+  cur_body_norm=$(printf "%s" "$current_body" | tr -d '\r')
+
+  if [[ "$new_body_norm" == "$cur_body_norm" ]]; then
+    ${VERBOSE} && print_msg "$COLOR_GREEN" "$ICON_SUCCESS" "Issue #${issue_number} is up to date."
+    return 0
+  fi
+
+  if $DRY_RUN; then
+    print_msg "$COLOR_GREEN" "$ICON_SUCCESS" "[dry-run] Would update issue #${issue_number}: '${issue_title}'"
+  else
+    print_msg "$COLOR_GREEN" "$ICON_SUCCESS" "Updating issue #${issue_number}: ${issue_title}"
+    gh issue edit "$issue_number" --repo "$repo" --body-file "$body_file" >/dev/null
+    # Ensure label present
+    gh issue edit "$issue_number" --repo "$repo" --add-label "$LABEL_NAME" >/dev/null 2>&1 || true
+  fi
+}
+
+# Iterate phases
+for idx in "${!PHASE_TITLES[@]}"; do
+  create_or_update_issue "$REPO_NAME" "${PHASE_TITLES[$idx]}" "${PHASE_TASK_FILES[$idx]}"
+done
+
+print_msg "$COLOR_GREEN" "$ICON_SUCCESS" "dbplan completed. Phases processed: ${#PHASE_TITLES[@]}"
+
+
