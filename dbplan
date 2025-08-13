@@ -68,7 +68,7 @@ get_repo() {
 
 usage() {
   cat <<EOF
-Usage: dbplan [--file PATH] [--label NAME] [--dry-run] [--update-closed] [--repo OWNER/NAME] [--verbose]
+Usage: dbplan [--file PATH] [--label NAME] [--dry-run] [--update-closed] [--repo OWNER/NAME] [--verbose] [--branch [ISSUE_NUMBER]]
 
 Parses a dev plan section from PROJECT.md/DEVPLAN.md and creates/updates GitHub issues (one per phase).
 
@@ -79,6 +79,7 @@ Options:
   --dry-run            Print actions without calling GitHub
   --update-closed      Allow updates to closed issues (default: skip closed)
   --verbose            Verbose logging
+  --branch [NUM]       Interactive branch mode. Lists feature issues to choose from and creates a local+remote branch. Optionally pass an issue number to skip prompting.
   --help               Show this help
 
 The plan section must be enclosed by markers:
@@ -101,6 +102,8 @@ REPO_OVERRIDE=""
 DRY_RUN=false
 UPDATE_CLOSED=false
 VERBOSE=false
+BRANCH_MODE=false
+BRANCH_ISSUE_NUMBER=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -110,6 +113,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=true; shift ;;
     --update-closed) UPDATE_CLOSED=true; shift ;;
     --verbose) VERBOSE=true; shift ;;
+    --branch) BRANCH_MODE=true; if [[ ${2-:-} != --* && -n ${2-} ]]; then BRANCH_ISSUE_NUMBER="$2"; shift 2; else shift; fi ;;
     --help|-h) usage; exit 0 ;;
     *) die "Unknown argument: $1" ;;
   esac
@@ -119,16 +123,18 @@ done
 command_exists gh || die "GitHub CLI (gh) is required"
 command_exists git || die "git is required"
 command_exists jq || die "jq is required"
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git repository"
 
-if [[ -z "${PLAN_FILE}" ]]; then
-  if [[ -f "DEVPLAN.md" ]]; then PLAN_FILE="DEVPLAN.md"; 
-  elif [[ -f "PROJECT.md" ]]; then PLAN_FILE="PROJECT.md"; 
-  else
-    die "No plan file found. Provide --file or add DEVPLAN.md/PROJECT.md"
+if [[ "$BRANCH_MODE" != true ]]; then
+  if [[ -z "${PLAN_FILE}" ]]; then
+    if [[ -f "DEVPLAN.md" ]]; then PLAN_FILE="DEVPLAN.md"; 
+    elif [[ -f "PROJECT.md" ]]; then PLAN_FILE="PROJECT.md"; 
+    else
+      die "No plan file found. Provide --file or add DEVPLAN.md/PROJECT.md"
+    fi
   fi
+  [[ -f "${PLAN_FILE}" ]] || die "Plan file not found: ${PLAN_FILE}"
 fi
-
-[[ -f "${PLAN_FILE}" ]] || die "Plan file not found: ${PLAN_FILE}"
 
 REPO_NAME="${REPO_OVERRIDE}"
 if [[ -z "${REPO_NAME}" ]]; then
@@ -139,52 +145,123 @@ fi
 ${VERBOSE} && print_msg "$COLOR_CYAN" "$ICON_GH" "Repo: ${REPO_NAME}"
 ${VERBOSE} && print_msg "$COLOR_CYAN" "$ICON_INFO" "Plan file: ${PLAN_FILE}"
 
-# Ensure label exists (best-effort)
+# Ensure label exists (best-effort) when not in branch mode (not required but harmless)
 ensure_label_exists "$REPO_NAME" "$LABEL_NAME"
 
 # ------------------------------ Parse section --------------------------------
-PLAN_SECTION=$(awk '/<!--[[:space:]]*devplan:start[[:space:]]*-->/{flag=1;next} /<!--[[:space:]]*devplan:end[[:space:]]*-->/{flag=0} flag' "$PLAN_FILE")
-
-if [[ -z "$PLAN_SECTION" ]]; then
-  die "No devplan section found between markers in ${PLAN_FILE}"
+if [[ "$BRANCH_MODE" != true ]]; then
+  PLAN_SECTION=$(awk '/<!--[[:space:]]*devplan:start[[:space:]]*-->/{flag=1;next} /<!--[[:space:]]*devplan:end[[:space:]]*-->/{flag=0} flag' "$PLAN_FILE")
+  if [[ -z "$PLAN_SECTION" ]]; then
+    die "No devplan section found between markers in ${PLAN_FILE}"
+  fi
 fi
 
 # --------------------------- Extract phases/tasks -----------------------------
 TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t dbplan)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-current_phase_title=""
-current_tasks_file=""
-declare -a PHASE_TITLES=()
-declare -a PHASE_TASK_FILES=()
+if [[ "$BRANCH_MODE" != true ]]; then
+  current_phase_title=""
+  current_tasks_file=""
+  declare -a PHASE_TITLES=()
+  declare -a PHASE_TASK_FILES=()
 
-while IFS= read -r line; do
-  if [[ "$line" =~ ^\#\#[[:space:]]*Phase:[[:space:]]*(.+)$ ]]; then
-    # flush previous phase if any
-    if [[ -n "$current_phase_title" ]]; then
-      PHASE_TITLES+=("$current_phase_title")
-      PHASE_TASK_FILES+=("$current_tasks_file")
-    fi
-    current_phase_title="${BASH_REMATCH[1]}"
-    current_tasks_file="${TMP_DIR}/tasks_$(printf "%s" "$current_phase_title" | tr ' ' '_' | tr -cd '[:alnum:]_').md"
-    : > "$current_tasks_file"
-  else
-    # capture checkbox lines under an active phase
-    if [[ -n "$current_phase_title" ]]; then
-      if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*\[[xX[:space:]]\][[:space:]].*$ ]]; then
-        printf "%s\n" "$line" >> "$current_tasks_file"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^\#\#[[:space:]]*Phase:[[:space:]]*(.+)$ ]]; then
+      # flush previous phase if any
+      if [[ -n "$current_phase_title" ]]; then
+        PHASE_TITLES+=("$current_phase_title")
+        PHASE_TASK_FILES+=("$current_tasks_file")
+      fi
+      current_phase_title="${BASH_REMATCH[1]}"
+      current_tasks_file="${TMP_DIR}/tasks_$(printf "%s" "$current_phase_title" | tr ' ' '_' | tr -cd '[:alnum:]_').md"
+      : > "$current_tasks_file"
+    else
+      # capture checkbox lines under an active phase
+      if [[ -n "$current_phase_title" ]]; then
+        if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*\[[xX[:space:]]\][[:space:]].*$ ]]; then
+          printf "%s\n" "$line" >> "$current_tasks_file"
+        fi
       fi
     fi
-  fi
-done <<< "$PLAN_SECTION"
+  done <<< "$PLAN_SECTION"
 
-# flush last phase
-if [[ -n "$current_phase_title" ]]; then
-  PHASE_TITLES+=("$current_phase_title")
-  PHASE_TASK_FILES+=("$current_tasks_file")
+  # flush last phase
+  if [[ -n "$current_phase_title" ]]; then
+    PHASE_TITLES+=("$current_phase_title")
+    PHASE_TASK_FILES+=("$current_tasks_file")
+  fi
+
+  [[ ${#PHASE_TITLES[@]} -gt 0 ]] || die "No phases found. Ensure lines like: '## Phase: Title' and checkbox tasks under them."
 fi
 
-[[ ${#PHASE_TITLES[@]} -gt 0 ]] || die "No phases found. Ensure lines like: '## Phase: Title' and checkbox tasks under them."
+# ------------------------------- Branch mode ---------------------------------
+slugify() {
+  local s="$1"
+  s=$(printf "%s" "$s" | tr '[:upper:]' '[:lower:]')
+  s=$(printf "%s" "$s" | sed -E 's/[^a-z0-9]+/-/g')
+  s=$(printf "%s" "$s" | sed -E 's/^-+|-+$//g')
+  printf "%s" "$s"
+}
+
+if [[ "$BRANCH_MODE" == true ]]; then
+  ${VERBOSE} && print_msg "$COLOR_CYAN" "$ICON_INFO" "Branch mode enabled"
+  # Fetch issues with the label and starting with Feature:
+  issues_json=$(gh issue list --repo "$REPO_NAME" --label "$LABEL_NAME" --state open --limit 200 --json number,title)
+  count=$(echo "$issues_json" | jq '[ .[] | select(.title|startswith("Feature: ")) ] | length')
+  if [[ "$count" -eq 0 ]]; then
+    die "No open feature issues found with label '${LABEL_NAME}'"
+  fi
+
+  if [[ -n "$BRANCH_ISSUE_NUMBER" ]]; then
+    sel=$(echo "$issues_json" | jq --arg n "$BRANCH_ISSUE_NUMBER" '[ .[] | select((.title|startswith("Feature: ")) and (.number|tostring==$n)) ] | .[0]')
+    if [[ "$sel" == "null" || -z "$sel" ]]; then
+      die "Issue #$BRANCH_ISSUE_NUMBER not found among open feature issues"
+    fi
+  else
+    # Print numbered menu
+    echo "Select a feature issue to branch from:"
+    menu=$(echo "$issues_json" | jq -r '[ .[] | select(.title|startswith("Feature: ")) ] | to_entries | .[] | "\(.key+1)) #\(.value.number) - \(.value.title)"')
+    printf "%s\n" "$menu"
+    printf "Enter selection (1-%s) or issue number: " "$count"
+    read -r choice
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+      # Determine if choice is menu index or issue number
+      sel=$(echo "$issues_json" | jq --argjson idx "$((choice-1))" '[ .[] | select(.title|startswith("Feature: ")) ] | .[$idx]')
+      if [[ "$sel" == "null" || -z "$sel" ]]; then
+        # try as issue number
+        sel=$(echo "$issues_json" | jq --arg n "$choice" '[ .[] | select((.title|startswith("Feature: ")) and (.number|tostring==$n)) ] | .[0]')
+        [[ "$sel" != "null" && -n "$sel" ]] || die "Invalid selection"
+      fi
+    else
+      die "Invalid selection"
+    fi
+  fi
+
+  issue_number=$(echo "$sel" | jq -r '.number')
+  issue_title=$(echo "$sel" | jq -r '.title')
+  slug=$(slugify "$issue_title")
+  branch_name="feature/issue-${issue_number}-${slug}"
+
+  print_msg "$COLOR_CYAN" "$ICON_INFO" "Creating branch: ${branch_name}"
+  if git rev-parse --verify "$branch_name" >/dev/null 2>&1; then
+    print_msg "$COLOR_YELLOW" "$ICON_WARNING" "Branch exists locally. Checking out."
+    git checkout "$branch_name"
+  else
+    git checkout -b "$branch_name"
+  fi
+
+  # Create remote if missing
+  if ! git ls-remote --exit-code --heads origin "$branch_name" >/dev/null 2>&1; then
+    git push -u origin "$branch_name"
+  else
+    print_msg "$COLOR_YELLOW" "$ICON_WARNING" "Remote branch already exists; setting upstream"
+    git branch --set-upstream-to "origin/${branch_name}" "$branch_name" || true
+  fi
+
+  print_msg "$COLOR_GREEN" "$ICON_SUCCESS" "Switched to branch ${branch_name}. Start developing!"
+  exit 0
+fi
 
 # ------------------------------- Issue sync ----------------------------------
 create_or_update_issue() {

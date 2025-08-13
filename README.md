@@ -81,3 +81,61 @@ You can use the following flags to run the script in a non-interactive or pre-co
 | `--no-build` | Skip the build step entirely.                  |
 | `--no-jar`   | Do not attach a JAR to the GitHub release.     |
 | `-y`, `--yes`  | Automatically answer 'yes' to all prompts.     |
+
+---
+
+## 🗺️ Plan → GitHub Issues (`dbplan`)
+
+`dbplan` reads a development plan section from `DEVPLAN.md` or `PROJECT.md` and creates/updates GitHub issues: one issue per phase with the phase's tasks as a checklist. It can also create a feature branch from a selected issue.
+
+### Requirements
+
+- `git`
+- `gh` (GitHub CLI) authenticated for the current repo
+- `jq`
+
+### Plan format
+
+Place your plan between markers. Phases use `## Phase:` headings; tasks are Markdown checkboxes.
+
+```markdown
+<!-- devplan:start -->
+## Phase: Authentication
+- [ ] Login page
+- [ ] OAuth with GitHub
+
+## Phase: Billing
+- [ ] Stripe integration
+- [ ] Webhook handler
+<!-- devplan:end -->
+```
+
+### Usage
+
+```bash
+# Make executable (once)
+chmod +x ./dbplan
+
+# Dry-run to preview actions
+./dbplan --dry-run
+
+# Create/update issues in detected repo
+./dbplan
+
+# Create a feature branch from a feature request (interactive)
+./dbplan --branch
+
+# Or specify a specific issue number directly
+./dbplan --branch 123
+
+# Common flags
+./dbplan --file DEVPLAN.md --label feature --verbose
+```
+
+Behavior:
+
+- Detects repo from current directory's git remote via `gh`.
+- Creates missing issues titled `Feature: <Phase>` with the specified label (default `feature`).
+- Updates existing issues when the checklist/body changes (idempotent via a hidden marker).
+- Skips closed issues unless `--update-closed` is provided.
+- Branch mode creates `feature/issue-<num>-<slug>` locally and pushes a remote tracking branch.

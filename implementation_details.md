@@ -32,4 +32,11 @@ Dependencies:
 
 - `git`, `gh`, `jq`, and standard POSIX tools (`awk`, `sed`, `grep`).
 
+Branch mode:
+
+- `--branch [ISSUE_NUMBER]` lists open issues labeled with the configured label and whose titles start with `Feature:`.
+- User selects from a menu or passes the issue number to skip prompting.
+- Branch name format: `feature/issue-<number>-<slugified-title>`.
+- Creates local branch if needed, checks it out, and pushes to `origin` with upstream tracking.
+
 
