@@ -83,14 +83,15 @@ show_help() {
   print_text "  ./dbbuild [FLAGS]"
   print_text ""
   print_message "$COLOR_PURPLE" "" "FLAGS:"
-  printf "${COLOR_GREEN}  --help          %s${COLOR_RESET}\n" "Show this help message."
-  printf "${COLOR_GREEN}  --patch         %s${COLOR_RESET}\n" "Set version bump to patch."
-  printf "${COLOR_GREEN}  --minor         %s${COLOR_RESET}\n" "Set version bump to minor."
-  printf "${COLOR_GREEN}  --major         %s${COLOR_RESET}\n" "Set version bump to major."
-  printf "${COLOR_GREEN}  --keep-version  %s${COLOR_RESET}\n" "Keep the current version for a re-release."
-  printf "${COLOR_GREEN}  --no-build      %s${COLOR_RESET}\n" "Skip the build step entirely."
-  printf "${COLOR_GREEN}  --no-jar        %s${COLOR_RESET}\n" "Do not attach a JAR to the GitHub release."
-  printf "${COLOR_GREEN}  -y, --yes       %s${COLOR_RESET}\n" "Automatically answer 'yes' to all prompts."
+  printf "${COLOR_GREEN}  --help               %s${COLOR_RESET}\n" "Show this help message."
+  printf "${COLOR_GREEN}  --patch              %s${COLOR_RESET}\n" "Set version bump to patch."
+  printf "${COLOR_GREEN}  --minor              %s${COLOR_RESET}\n" "Set version bump to minor."
+  printf "${COLOR_GREEN}  --major              %s${COLOR_RESET}\n" "Set version bump to major."
+  printf "${COLOR_GREEN}  --keep-version       %s${COLOR_RESET}\n" "Keep the current version for a re-release."
+  printf "${COLOR_GREEN}  --set-version <VER>  %s${COLOR_RESET}\n" "Set a specific version number (e.g., 1.2.3-rc1)."
+  printf "${COLOR_GREEN}  --no-build           %s${COLOR_RESET}\n" "Skip the build step entirely."
+  printf "${COLOR_GREEN}  --no-jar             %s${COLOR_RESET}\n" "Do not attach a JAR to the GitHub release."
+  printf "${COLOR_GREEN}  -y, --yes            %s${COLOR_RESET}\n" "Automatically answer 'yes' to all prompts."
   print_text ""
 }
 
@@ -98,21 +99,30 @@ show_help() {
 # --- 🚩 ARGUMENT PARSING 🚩 ---
 
 BUMP_TYPE=""
+SET_VERSION=""
 AUTO_YES=false
 NO_BUILD=false
 NO_JAR=false
 
-for arg in "$@"; do
-  case $arg in
+# Use a while loop to properly handle flags that take arguments.
+while [[ $# -gt 0 ]]; do
+  key="$1"
+  case $key in
     --help) show_help; exit 0 ;;
-    --patch) BUMP_TYPE="patch" ;;
-    --minor) BUMP_TYPE="minor" ;;
-    --major) BUMP_TYPE="major" ;;
-    --keep-version) BUMP_TYPE="keep" ;;
-    --no-build) NO_BUILD=true ;;
-    --no-jar) NO_JAR=true ;;
-    -y|--yes) AUTO_YES=true ;;
-    *) print_message "$COLOR_RED" "$ICON_ERROR" "Unknown argument: $arg"; show_help; exit 1 ;;
+    --patch) BUMP_TYPE="patch"; shift ;;
+    --minor) BUMP_TYPE="minor"; shift ;;
+    --major) BUMP_TYPE="major"; shift ;;
+    --keep-version) BUMP_TYPE="keep"; shift ;;
+    --set-version)
+      SET_VERSION="$2"
+      BUMP_TYPE="custom"
+      shift # past argument
+      shift # past value
+      ;;
+    --no-build) NO_BUILD=true; shift ;;
+    --no-jar) NO_JAR=true; shift ;;
+    -y|--yes) AUTO_YES=true; shift ;;
+    *) print_message "$COLOR_RED" "$ICON_ERROR" "Unknown argument: $1"; show_help; exit 1 ;;
   esac
 done
 
@@ -207,33 +217,39 @@ if [ -z "$BUMP_TYPE" ]; then
     if [ "$COMMIT_COUNT" -gt 20 ]; then RECOMMENDATION="major"; fi
     print_message "$COLOR_YELLOW" "$ICON_INFO" "Recommendation: based on ${COMMIT_COUNT} commits, a '${RECOMMENDATION}' release is suggested."
     printf "${COLOR_CYAN}%s${COLOR_RESET}\n" "Select the version bump:"
-    printf "  1) patch\n  2) minor\n  3) major\n  4) keep current\n"
-    printf "${COLOR_CYAN}%s %s${COLOR_RESET}" "$ICON_QUESTION" "Enter your choice (1-4): "
+    printf "  1) patch\n  2) minor\n  3) major\n  4) keep current\n  5) set specific version\n"
+    printf "${COLOR_CYAN}%s %s${COLOR_RESET}" "$ICON_QUESTION" "Enter your choice (1-5): "
     read -r choice
     case $choice in
       1) BUMP_TYPE="patch" ;;
       2) BUMP_TYPE="minor" ;;
       3) BUMP_TYPE="major" ;;
       4) BUMP_TYPE="keep" ;;
+      5) BUMP_TYPE="custom" ;;
       *) print_message "$COLOR_RED" "$ICON_ERROR" "Invalid choice. Aborting."; exit 1 ;;
     esac
 fi
 
-if [ "$BUMP_TYPE" = "keep" ]; then
+if [ "$BUMP_TYPE" = "custom" ]; then
+  if [ -z "$SET_VERSION" ]; then
+    printf "${COLOR_CYAN}%s %s${COLOR_RESET}" "$ICON_QUESTION" "Enter the new version number: "
+    read -r SET_VERSION
+  fi
+  NEW_VERSION=$SET_VERSION
+elif [ "$BUMP_TYPE" = "keep" ]; then
   NEW_VERSION=$CURRENT_VERSION
-  print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Keeping current version: ${NEW_VERSION}"
 else
   MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
   MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
-  PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3)
+  PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3 | sed 's/[^0-9]*//') # Ensure patch is numeric
   case $BUMP_TYPE in
     "patch") PATCH=$((PATCH + 1)) ;;
     "minor") MINOR=$((MINOR + 1)); PATCH=0 ;;
     "major") MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
   esac
   NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-  print_message "$COLOR_GREEN" "$ICON_SUCCESS" "New version will be: ${NEW_VERSION}"
 fi
+print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Version will be: ${NEW_VERSION}"
 
 if ! [ "$AUTO_YES" = true ] && ! prompt_yes_no "Do you want to proceed?"; then
     print_message "$COLOR_RED" "$ICON_ERROR" "Aborting."; exit 1
@@ -323,7 +339,6 @@ if [ "$BUMP_TYPE" = "keep" ]; then
 fi
 git commit "${COMMIT_ARGS[@]}"
 
-# Handle Git Tagging, especially if tag already exists
 TAG_NAME="v${NEW_VERSION}"
 if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
     print_message "$COLOR_YELLOW" "$ICON_WARNING" "Tag '$TAG_NAME' already exists."
@@ -366,7 +381,7 @@ else
         fi
         if [ "$AUTO_YES" = true ] || prompt_yes_no "Create a GitHub release?"; then
             print_message "$COLOR_CYAN" "$ICON_RELEASE" "Creating GitHub release..."
-            RELEASE_ARGS=("$TAG_NAME" --title "Release ${NEW_VERSION}" --notes "Release version ${NEW_VERSION}")
+            RELEASE_ARGS=($TAG_NAME --title "Release ${NEW_VERSION}" --notes "Release version ${NEW_VERSION}")
             if [ "$NO_JAR" = false ]; then
                 JAR_FILE=$(find ./target -name "*.jar" 2>/dev/null | head -n 1)
                 if [ -n "$JAR_FILE" ]; then
