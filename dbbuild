@@ -41,6 +41,7 @@ ICON_PULL_REQUEST="🔀"
 ICON_RELEASE="🎉"
 ICON_QUESTION="❓"
 ICON_SHIELD="🛡️"
+ICON_CF="☁️"
 
 
 # --- 헬퍼 함수 (HELPER FUNCTIONS) ---
@@ -104,25 +105,19 @@ AUTO_YES=false
 NO_BUILD=false
 NO_JAR=false
 
-# Use a while loop to properly handle flags that take arguments.
 while [[ $# -gt 0 ]]; do
   key="$1"
   case $key in
-    --help) show_help; exit 0 ;;
-    --patch) BUMP_TYPE="patch"; shift ;;
-    --minor) BUMP_TYPE="minor"; shift ;;
-    --major) BUMP_TYPE="major"; shift ;;
-    --keep-version) BUMP_TYPE="keep"; shift ;;
-    --set-version)
-      SET_VERSION="$2"
-      BUMP_TYPE="custom"
-      shift # past argument
-      shift # past value
-      ;;
-    --no-build) NO_BUILD=true; shift ;;
-    --no-jar) NO_JAR=true; shift ;;
-    -y|--yes) AUTO_YES=true; shift ;;
-    *) print_message "$COLOR_RED" "$ICON_ERROR" "Unknown argument: $1"; show_help; exit 1 ;;
+    --help) show_help; exit 0 ;; 
+    --patch) BUMP_TYPE="patch"; shift ;; 
+    --minor) BUMP_TYPE="minor"; shift ;; 
+    --major) BUMP_TYPE="major"; shift ;; 
+    --keep-version) BUMP_TYPE="keep"; shift ;; 
+    --set-version) SET_VERSION="$2"; BUMP_TYPE="custom"; shift; shift ;; 
+    --no-build) NO_BUILD=true; shift ;; 
+    --no-jar) NO_JAR=true; shift ;; 
+    -y|--yes) AUTO_YES=true; shift ;; 
+    *) print_message "$COLOR_RED" "$ICON_ERROR" "Unknown argument: $1"; show_help; exit 1 ;; 
   esac
 done
 
@@ -132,19 +127,19 @@ done
 # 1. Prerequisite Checks
 print_message "$COLOR_BLUE" "$ICON_INFO" "Checking prerequisites..."
 if ! command_exists git; then
-  print_message "$COLOR_RED" "$ICON_ERROR" "Git is not installed. Please install it and try again."
+  print_message "$COLOR_RED" "$ICON_ERROR" "Git is not installed."
   exit 1
 fi
 print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Git is installed."
 
 # 2. Git Repository & Remote Setup
 if ! git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
-  print_message "$COLOR_YELLOW" "$ICON_WARNING" "This directory is not a git repository."
-  if [ "$AUTO_YES" = true ] || prompt_yes_no "Do you want to initialize a new repository here?"; then
+  print_message "$COLOR_YELLOW" "$ICON_WARNING" "This is not a git repository."
+  if [ "$AUTO_YES" = true ] || prompt_yes_no "Initialize a new repository here?"; then
     git init
     print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Initialized a new git repository."
   else
-    print_message "$COLOR_RED" "$ICON_ERROR" "Aborting. Please run dbbuild inside a git repository."
+    print_message "$COLOR_RED" "$ICON_ERROR" "Aborting."
     exit 1
   fi
 fi
@@ -155,7 +150,7 @@ if ! git remote -v | grep -q '.'; then
         print_message "$COLOR_RED" "$ICON_ERROR" "Cannot proceed without a remote in non-interactive mode."
         exit 1
     fi
-    if prompt_yes_no "Do you want to add a remote repository now?"; then
+    if prompt_yes_no "Add a remote repository now?"; then
         printf "${COLOR_CYAN}%s %s${COLOR_RESET}" "$ICON_QUESTION" "Enter the remote repository URL: "
         read -r remote_url
         if [ -z "$remote_url" ]; then
@@ -163,7 +158,7 @@ if ! git remote -v | grep -q '.'; then
             exit 1
         fi
         git remote add origin "$remote_url"
-        print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Remote repository added successfully."
+        print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Remote repository added."
     else
         print_message "$COLOR_YELLOW" "$ICON_WARNING" "Proceeding without a remote. Pushing will not be possible."
     fi
@@ -181,8 +176,7 @@ setup_gitignore() {
     touch .gitignore
   fi
   for pattern in "${gitignore_patterns[@]}"; do
-    if ! grep -qF -- "$pattern" .gitignore;
-    then
+    if ! grep -qF -- "$pattern" .gitignore; then
       print_message "$COLOR_CYAN" "$ICON_INFO" "Adding '$pattern' to .gitignore."
       echo "$pattern" >> .gitignore
     fi
@@ -221,12 +215,12 @@ if [ -z "$BUMP_TYPE" ]; then
     printf "${COLOR_CYAN}%s %s${COLOR_RESET}" "$ICON_QUESTION" "Enter your choice (1-5): "
     read -r choice
     case $choice in
-      1) BUMP_TYPE="patch" ;;
-      2) BUMP_TYPE="minor" ;;
-      3) BUMP_TYPE="major" ;;
-      4) BUMP_TYPE="keep" ;;
-      5) BUMP_TYPE="custom" ;;
-      *) print_message "$COLOR_RED" "$ICON_ERROR" "Invalid choice. Aborting."; exit 1 ;;
+      1) BUMP_TYPE="patch" ;; 
+      2) BUMP_TYPE="minor" ;; 
+      3) BUMP_TYPE="major" ;; 
+      4) BUMP_TYPE="keep" ;; 
+      5) BUMP_TYPE="custom" ;; 
+      *) print_message "$COLOR_RED" "$ICON_ERROR" "Invalid choice. Aborting."; exit 1 ;; 
     esac
 fi
 
@@ -241,11 +235,11 @@ elif [ "$BUMP_TYPE" = "keep" ]; then
 else
   MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
   MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
-  PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3 | sed 's/[^0-9]*//') # Ensure patch is numeric
+  PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3 | sed 's/[^0-9]*//')
   case $BUMP_TYPE in
-    "patch") PATCH=$((PATCH + 1)) ;;
-    "minor") MINOR=$((MINOR + 1)); PATCH=0 ;;
-    "major") MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+    "patch") PATCH=$((PATCH + 1)) ;; 
+    "minor") MINOR=$((MINOR + 1)); PATCH=0 ;; 
+    "major") MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;; 
   esac
   NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
 fi
@@ -259,6 +253,9 @@ if [ "$BUMP_TYPE" != "keep" ]; then
   update_version() {
     local version_to_set=$1
     if [ -f "pom.xml" ]; then
+      # This sed command is designed to replace the *first* <version> tag in a pom.xml,
+      # which is conventionally the main project version. It is not guaranteed to work
+      # on unconventional or multi-module POM structures.
       sed -i.bak "0,/<version>/{s/<version>.*<\/version>/<version>${version_to_set}<\/version>/}" pom.xml && rm pom.xml.bak
       print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Updated version in pom.xml to ${version_to_set}"
     elif [ -f "VERSION" ]; then
@@ -272,8 +269,9 @@ if [ "$BUMP_TYPE" != "keep" ]; then
   update_version "$NEW_VERSION"
 fi
 
-# 5. Build Project
+# 5. Build Project & Update Manifests
 print_message "$COLOR_BLUE" "$ICON_BUILD" "Handling build..."
+BUILT_JAR_PATH=""
 if [ "$NO_BUILD" = true ]; then
     print_message "$COLOR_YELLOW" "$ICON_INFO" "Skipping build step due to --no-build flag."
 elif [ -f "pom.xml" ]; then
@@ -284,12 +282,31 @@ elif [ -f "pom.xml" ]; then
             exit 1
         fi
         print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Maven build successful."
+        BUILT_JAR_PATH=$(find ./target -name "*.jar" 2>/dev/null | head -n 1)
     else
         print_message "$COLOR_YELLOW" "$ICON_INFO" "Build skipped by user."
     fi
 else
   print_message "$COLOR_YELLOW" "$ICON_INFO" "No build file (pom.xml) found. Skipping build step."
 fi
+
+update_cf_manifest() {
+    local manifest_file=""
+    if [ -f "manifest.yml" ]; then manifest_file="manifest.yml"; fi
+    if [ -f "manifest.yaml" ]; then manifest_file="manifest.yaml"; fi
+    
+    if [ -n "$manifest_file" ] && [ -n "$BUILT_JAR_PATH" ]; then
+        print_message "$COLOR_BLUE" "$ICON_CF" "Updating Cloud Foundry manifest..."
+        if ! grep -q "path:" "$manifest_file"; then
+            print_message "$COLOR_YELLOW" "$ICON_WARNING" "No 'path' attribute found in $manifest_file. Skipping update."
+            return
+        fi
+        # Use sed to replace the path, preserving indentation.
+        sed -i.bak "s|^\[[:space:]]*path:\]\(.*\)|\1 ${BUILT_JAR_PATH}|" "$manifest_file" && rm "${manifest_file}.bak"
+        print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Updated '$manifest_file' to point to $BUILT_JAR_PATH."
+    fi
+}
+update_cf_manifest
 
 # 6. Pre-Commit Security Scan & Git Operations
 print_message "$COLOR_BLUE" "$ICON_SHIELD" "Performing security scan and Git operations..."
@@ -302,7 +319,8 @@ scan_for_secrets() {
       return 0
   fi
   local keyword_pattern='(password|secret|token|apikey|private_key)'
-  local safe_assignment_pattern='(=\s*(\$|\{\{|\<%|env\()|:\s*(\$|\{\{))'
+  # Ignore assignments to variables or placeholders like <password> or ${VAR}
+  local safe_assignment_pattern='(=\s*(\$|\{\{<%|env\(|<)|:\s*(\$|\{\{|<))'
   local all_findings=""
   for file in $staged_files; do
     if ! [[ $(file -b --mime-type "$file") == text/* ]]; then continue; fi
@@ -381,12 +399,11 @@ else
         fi
         if [ "$AUTO_YES" = true ] || prompt_yes_no "Create a GitHub release?"; then
             print_message "$COLOR_CYAN" "$ICON_RELEASE" "Creating GitHub release..."
-            RELEASE_ARGS=($TAG_NAME --title "Release ${NEW_VERSION}" --notes "Release version ${NEW_VERSION}")
+            RELEASE_ARGS=("$TAG_NAME" --title "Release ${NEW_VERSION}" --notes "Release version ${NEW_VERSION}")
             if [ "$NO_JAR" = false ]; then
-                JAR_FILE=$(find ./target -name "*.jar" 2>/dev/null | head -n 1)
-                if [ -n "$JAR_FILE" ]; then
-                    RELEASE_ARGS+=("$JAR_FILE")
-                    print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Found JAR file to attach: $JAR_FILE"
+                if [ -n "$BUILT_JAR_PATH" ]; then
+                    RELEASE_ARGS+=("$BUILT_JAR_PATH")
+                    print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Found JAR file to attach: $BUILT_JAR_PATH"
                 else
                     print_message "$COLOR_YELLOW" "$ICON_WARNING" "No JAR file found in ./target to attach."
                 fi
