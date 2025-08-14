@@ -370,7 +370,7 @@ elif [ -f "pom.xml" ]; then
     if [ "$AUTO_YES" = true ] || prompt_yes_no_default "Build project with Maven?" "y"; then
         print_message "$COLOR_CYAN" "$ICON_INFO" "Building project with Maven..."
         
-        local mvn_build_args="clean install"
+        mvn_build_args="clean install"
         if [ "$SKIP_TESTS" = true ]; then
             print_message "$COLOR_YELLOW" "$ICON_WARNING" "Skipping tests as requested."
             mvn_build_args="$mvn_build_args -DskipTests"
