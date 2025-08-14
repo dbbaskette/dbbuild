@@ -128,6 +128,9 @@ chmod +x ./dbplan
 # Or specify a specific issue number directly
 ./dbplan --branch 123
 
+# Create a PR from current branch, link to issue, then merge (squash)
+./dbplan --pr 123 --merge --merge-method squash --base main
+
 # Common flags
 ./dbplan --file DEVPLAN.md --label feature --verbose
 ```
@@ -139,3 +142,4 @@ Behavior:
 - Updates existing issues when the checklist/body changes (idempotent via a hidden marker).
 - Skips closed issues unless `--update-closed` is provided.
 - Branch mode creates `feature/issue-<num>-<slug>` locally and pushes a remote tracking branch.
+- PR mode creates a PR to `--base` (default `main`) with body `Closes #<num>`, and can auto-merge and delete the branch.

@@ -68,7 +68,7 @@ get_repo() {
 
 usage() {
   cat <<EOF
-Usage: dbplan [--file PATH] [--label NAME] [--dry-run] [--update-closed] [--repo OWNER/NAME] [--verbose] [--branch [ISSUE_NUMBER]]
+Usage: dbplan [--file PATH] [--label NAME] [--dry-run] [--update-closed] [--repo OWNER/NAME] [--verbose] [--branch [ISSUE_NUMBER]] [--pr [ISSUE_NUMBER]] [--merge] [--merge-method METHOD] [--base BRANCH] [--draft]
 
 Parses a dev plan section from PROJECT.md/DEVPLAN.md and creates/updates GitHub issues (one per phase).
 
@@ -80,6 +80,11 @@ Options:
   --update-closed      Allow updates to closed issues (default: skip closed)
   --verbose            Verbose logging
   --branch [NUM]       Interactive branch mode. Lists feature issues to choose from and creates a local+remote branch. Optionally pass an issue number to skip prompting.
+  --pr [NUM]           Create a pull request from the current branch. If NUM omitted, infer from branch name (issue-<NUM>) or prompt to select. PR body includes "Closes #NUM".
+  --merge              After creating the PR, merge it and delete the branch.
+  --merge-method M     One of: squash (default), merge, rebase.
+  --base BRANCH        Base branch for the PR (default: main).
+  --draft              Create PR as a draft.
   --help               Show this help
 
 The plan section must be enclosed by markers:
@@ -104,6 +109,12 @@ UPDATE_CLOSED=false
 VERBOSE=false
 BRANCH_MODE=false
 BRANCH_ISSUE_NUMBER=""
+PR_MODE=false
+PR_ISSUE_NUMBER=""
+PR_MERGE=false
+PR_MERGE_METHOD="squash"
+PR_BASE_BRANCH="main"
+PR_DRAFT=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -114,6 +125,11 @@ while [[ $# -gt 0 ]]; do
     --update-closed) UPDATE_CLOSED=true; shift ;;
     --verbose) VERBOSE=true; shift ;;
     --branch) BRANCH_MODE=true; if [[ ${2-:-} != --* && -n ${2-} ]]; then BRANCH_ISSUE_NUMBER="$2"; shift 2; else shift; fi ;;
+    --pr) PR_MODE=true; if [[ ${2-:-} != --* && -n ${2-} ]]; then PR_ISSUE_NUMBER="$2"; shift 2; else shift; fi ;;
+    --merge) PR_MERGE=true; shift ;;
+    --merge-method) PR_MERGE_METHOD="$2"; shift 2 ;;
+    --base) PR_BASE_BRANCH="$2"; shift 2 ;;
+    --draft) PR_DRAFT=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) die "Unknown argument: $1" ;;
   esac
@@ -260,6 +276,103 @@ if [[ "$BRANCH_MODE" == true ]]; then
   fi
 
   print_msg "$COLOR_GREEN" "$ICON_SUCCESS" "Switched to branch ${branch_name}. Start developing!"
+  exit 0
+fi
+
+# ------------------------------- PR mode -------------------------------------
+
+infer_issue_from_branch() {
+  local branch="$1"
+  if [[ "$branch" =~ issue-([0-9]+) ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo ""
+  fi
+}
+
+if [[ "$PR_MODE" == true ]]; then
+  ${VERBOSE} && print_msg "$COLOR_CYAN" "$ICON_INFO" "PR mode enabled"
+  current_branch=$(git symbolic-ref --short HEAD)
+
+  # Try inferring issue number from the current branch name (feature/issue-<N>-...)
+  if [[ -z "$PR_ISSUE_NUMBER" ]]; then
+    PR_ISSUE_NUMBER=$(infer_issue_from_branch "$current_branch")
+  fi
+
+  # If still empty, allow interactive select among open feature issues
+  if [[ -z "$PR_ISSUE_NUMBER" ]]; then
+    issues_json=$(gh issue list --repo "$REPO_NAME" --label "$LABEL_NAME" --state open --limit 200 --json number,title)
+    count=$(echo "$issues_json" | jq '[ .[] | select(.title|startswith("Feature: ")) ] | length')
+    if [[ "$count" -eq 0 ]]; then
+      die "No open feature issues found to create a PR against."
+    fi
+    echo "Select an issue to associate with the PR:"
+    menu=$(echo "$issues_json" | jq -r '[ .[] | select(.title|startswith("Feature: ")) ] | to_entries | .[] | "\(.key+1)) #\(.value.number) - \(.value.title)"')
+    printf "%s\n" "$menu"
+    printf "Enter selection (1-%s) or issue number: " "$count"
+    read -r choice
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+      sel=$(echo "$issues_json" | jq --argjson idx "$((choice-1))" '[ .[] | select(.title|startswith("Feature: ")) ] | .[$idx]')
+      if [[ "$sel" == "null" || -z "$sel" ]]; then
+        sel=$(echo "$issues_json" | jq --arg n "$choice" '[ .[] | select((.title|startswith("Feature: ")) and (.number|tostring==$n)) ] | .[0]')
+        [[ "$sel" != "null" && -n "$sel" ]] || die "Invalid selection"
+      fi
+      PR_ISSUE_NUMBER=$(echo "$sel" | jq -r '.number')
+    else
+      die "Invalid selection"
+    fi
+  fi
+
+  # Ensure we are not on base branch now
+  if [[ "$current_branch" == "$PR_BASE_BRANCH" ]]; then
+    die "Current branch equals base (${PR_BASE_BRANCH}). Checkout a feature branch first or use --branch."
+  fi
+
+  # Ensure branch is pushed
+  if ! git rev-parse --verify "@{u}" >/dev/null 2>&1; then
+    print_msg "$COLOR_CYAN" "$ICON_INFO" "Pushing current branch and setting upstream..."
+    git push -u origin "$current_branch"
+  fi
+
+  # Title/body for PR
+  issue_title=$(gh issue view "$PR_ISSUE_NUMBER" --repo "$REPO_NAME" --json title -q .title 2>/dev/null || echo "Feature #$PR_ISSUE_NUMBER")
+  pr_title="$issue_title"
+  pr_body="Closes #${PR_ISSUE_NUMBER}"
+
+  create_args=(--repo "$REPO_NAME" --base "$PR_BASE_BRANCH" --title "$pr_title" --body "$pr_body")
+  $PR_DRAFT && create_args+=(--draft)
+
+  print_msg "$COLOR_CYAN" "$ICON_INFO" "Creating PR to ${PR_BASE_BRANCH} for #${PR_ISSUE_NUMBER}..."
+  if gh pr create "${create_args[@]}"; then
+    print_msg "$COLOR_GREEN" "$ICON_SUCCESS" "PR created."
+  else
+    die "Failed to create PR."
+  fi
+
+  if $PR_MERGE; then
+    # Determine PR number for current branch
+    pr_num=$(gh pr view --repo "$REPO_NAME" --head "$current_branch" --json number -q .number 2>/dev/null || true)
+    if [[ -z "$pr_num" || "$pr_num" == "null" ]]; then
+      pr_num=$(gh pr list --repo "$REPO_NAME" --head "$current_branch" --state open --json number -q '.[0].number' 2>/dev/null || true)
+    fi
+    [[ -n "$pr_num" ]] || die "Unable to determine PR number for merge."
+    method_flag="--squash"
+    case "$PR_MERGE_METHOD" in
+      squash) method_flag="--squash" ;;
+      merge) method_flag="--merge" ;;
+      rebase) method_flag="--rebase" ;;
+      *) print_msg "$COLOR_YELLOW" "$ICON_WARNING" "Unknown merge method '${PR_MERGE_METHOD}', defaulting to squash." ;;
+    esac
+    print_msg "$COLOR_CYAN" "$ICON_INFO" "Merging PR #${pr_num} with method ${PR_MERGE_METHOD}..."
+    if gh pr merge "$pr_num" "$method_flag" --delete-branch --repo "$REPO_NAME"; then
+      print_msg "$COLOR_GREEN" "$ICON_SUCCESS" "PR merged and branch deleted."
+      git checkout "$PR_BASE_BRANCH" >/dev/null 2>&1 || true
+      git pull --ff-only || true
+    else
+      die "Failed to merge PR."
+    fi
+  fi
+
   exit 0
 fi
 

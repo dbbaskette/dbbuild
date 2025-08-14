@@ -70,6 +70,29 @@ prompt_yes_no() {
   fi
 }
 
+# Prompt with a default answer (y or n). Empty input selects the default.
+prompt_yes_no_default() {
+  local message=$1
+  local default=${2:-n}
+  local prompt_suffix="(y/n)"
+  if [[ $default == "y" || $default == "Y" ]]; then
+    prompt_suffix="(Y/n)"
+  else
+    prompt_suffix="(y/N)"
+  fi
+  local reply
+  printf "${COLOR_CYAN}%s %s %s ${COLOR_RESET}" "$ICON_QUESTION" "$message" "$prompt_suffix"
+  read -r reply
+  if [[ -z $reply ]]; then
+    reply=$default
+  fi
+  if [[ $reply =~ ^[Yy]$ ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
 command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
@@ -92,6 +115,8 @@ show_help() {
   printf "${COLOR_GREEN}  --set-version <VER>  %s${COLOR_RESET}\n" "Set a specific version number (e.g., 1.2.3-rc1)."
   printf "${COLOR_GREEN}  --no-build           %s${COLOR_RESET}\n" "Skip the build step entirely."
   printf "${COLOR_GREEN}  --no-jar             %s${COLOR_RESET}\n" "Do not attach a JAR to the GitHub release."
+  printf "${COLOR_GREEN}  --skip-tests         %s${COLOR_RESET}\n" "Skip running tests during the build."
+  printf "${COLOR_GREEN}  --commit-message <MSG> %s${COLOR_RESET}\n" "Use a custom commit message."
   printf "${COLOR_GREEN}  -y, --yes            %s${COLOR_RESET}\n" "Automatically answer 'yes' to all prompts."
   print_text ""
 }
@@ -104,6 +129,9 @@ SET_VERSION=""
 AUTO_YES=false
 NO_BUILD=false
 NO_JAR=false
+SKIP_TESTS=false
+BUILD_RAN=false
+COMMIT_MESSAGE=""
 
 while [[ $# -gt 0 ]]; do
   key="$1"
@@ -115,7 +143,9 @@ while [[ $# -gt 0 ]]; do
     --keep-version) BUMP_TYPE="keep"; shift ;; 
     --set-version) SET_VERSION="$2"; BUMP_TYPE="custom"; shift; shift ;; 
     --no-build) NO_BUILD=true; shift ;; 
-    --no-jar) NO_JAR=true; shift ;; 
+    --no-jar) NO_JAR=true; shift ;;
+    --skip-tests) SKIP_TESTS=true; shift ;;
+    --commit-message) COMMIT_MESSAGE="$2"; shift; shift ;;
     -y|--yes) AUTO_YES=true; shift ;; 
     *) print_message "$COLOR_RED" "$ICON_ERROR" "Unknown argument: $1"; show_help; exit 1 ;; 
   esac
@@ -282,11 +312,43 @@ if [ "$BUMP_TYPE" != "keep" ]; then
             print_message "$COLOR_RED" "$ICON_ERROR" "Maven (mvn) is not installed, but a pom.xml was found. Cannot update version."
             exit 1
         fi
-        print_message "$COLOR_CYAN" "$ICON_INFO" "Using Maven to update version in all modules..."
-        if ! mvn versions:set -DnewVersion="$version_to_set" -DprocessAllModules=true -DgenerateBackupPoms=false; then
-            print_message "$COLOR_RED" "$ICON_ERROR" "Maven versions:set command failed."
-            exit 1
+
+        # Find Maven root (prefer an aggregator pom with <modules>, else nearest pom upwards)
+        find_maven_root() {
+          local dir="$PWD"; local best="";
+          while true; do
+            if [ -f "$dir/pom.xml" ]; then best="$dir"; fi
+            local parent
+            parent=$(dirname "$dir")
+            if [ "$parent" = "$dir" ]; then break; fi
+            dir="$parent"
+          done
+          # If best has <modules>, prefer it; otherwise just return best
+          if [ -n "$best" ] && grep -q "<modules>" "$best/pom.xml" 2>/dev/null; then
+            echo "$best"
+          else
+            echo "$best"
+          fi
+        }
+
+        local root_dir
+        root_dir=$(find_maven_root)
+        if [ -z "$root_dir" ]; then root_dir="$PWD"; fi
+
+        print_message "$COLOR_CYAN" "$ICON_INFO" "Using Maven to update version in all modules (root: $root_dir)..."
+
+        local mvn_flags
+        mvn_flags=("-B" "-ntp" "versions:set" "-DnewVersion=${version_to_set}" "-DprocessAllModules=true" "-DgenerateBackupPoms=false" "-DupdateMatchingVersions=true")
+
+        # CI-friendly versions support (revision property)
+        if grep -q "<revision>" "$root_dir/pom.xml" 2>/dev/null; then
+          mvn_flags+=("-Dproperty=revision")
         fi
+
+        (
+          cd "$root_dir" && mvn "${mvn_flags[@]}"
+        ) || { print_message "$COLOR_RED" "$ICON_ERROR" "Maven versions:set command failed."; exit 1; }
+
         print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Successfully updated version in all pom.xml files to ${version_to_set}."
     elif [ -f "VERSION" ]; then
       echo "$version_to_set" > VERSION
@@ -305,12 +367,20 @@ BUILT_JAR_PATH=""
 if [ "$NO_BUILD" = true ]; then
     print_message "$COLOR_YELLOW" "$ICON_INFO" "Skipping build step due to --no-build flag."
 elif [ -f "pom.xml" ]; then
-    if [ "$AUTO_YES" = true ] || prompt_yes_no "Build project with Maven?"; then
+    if [ "$AUTO_YES" = true ] || prompt_yes_no_default "Build project with Maven?" "y"; then
         print_message "$COLOR_CYAN" "$ICON_INFO" "Building project with Maven..."
-        if ! mvn clean install; then
+        
+        local mvn_build_args="clean install"
+        if [ "$SKIP_TESTS" = true ]; then
+            print_message "$COLOR_YELLOW" "$ICON_WARNING" "Skipping tests as requested."
+            mvn_build_args="$mvn_build_args -DskipTests"
+        fi
+
+        if ! mvn $mvn_build_args; then
             print_message "$COLOR_RED" "$ICON_ERROR" "Maven build failed. Aborting."
             exit 1
         fi
+        BUILD_RAN=true
         print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Maven build successful."
     else
         print_message "$COLOR_YELLOW" "$ICON_INFO" "Build skipped by user."
@@ -353,7 +423,7 @@ update_cf_manifest() {
     fi
     
     print_message "$COLOR_CYAN" "$ICON_INFO" "Attempting to update manifest path..."
-    sed -i.bak "s|^\[[:space:]]*path:\).*|\1 ${BUILT_JAR_PATH}|" "$manifest_file" && rm "${manifest_file}.bak"
+    sed -i.bak -E "s|^([[:space:]]*path:).*|\\1 ${BUILT_JAR_PATH}|" "$manifest_file" && rm "${manifest_file}.bak"
     
     if [[ $(git status --porcelain "$manifest_file") ]]; then
         print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Successfully modified $manifest_file."
@@ -403,12 +473,20 @@ scan_for_secrets() {
 git add .
 scan_for_secrets
 
-COMMIT_MSG="chore(release): version ${NEW_VERSION}"
+if [ -n "$COMMIT_MESSAGE" ]; then
+  COMMIT_MSG="$COMMIT_MESSAGE"
+else
+  COMMIT_MSG="chore(release): version ${NEW_VERSION}"
+  if [ "$BUMP_TYPE" = "keep" ]; then
+    COMMIT_MSG="chore(release): trigger build for version ${NEW_VERSION}"
+  fi
+fi
+
 COMMIT_ARGS=("-m" "$COMMIT_MSG")
-if [ "$BUMP_TYPE" = "keep" ]; then
-  COMMIT_MSG="chore(release): trigger build for version ${NEW_VERSION}"
+if [ "$BUMP_TYPE" = "keep" ] && [ -z "$COMMIT_MESSAGE" ]; then
   COMMIT_ARGS=("--allow-empty" "-m" "$COMMIT_MSG")
 fi
+
 git commit "${COMMIT_ARGS[@]}"
 
 TAG_NAME="v${NEW_VERSION}"
@@ -454,15 +532,36 @@ else
             print_message "$COLOR_CYAN" "$ICON_RELEASE" "Creating GitHub release..."
             RELEASE_ARGS=("$TAG_NAME" --title "Release ${NEW_VERSION}" --notes "Release version ${NEW_VERSION}")
             if [ "$NO_JAR" = false ]; then
-                # Re-find the JAR path in case the build was skipped earlier but a JAR exists.
-                if [ -z "$BUILT_JAR_PATH" ]; then
-                    BUILT_JAR_PATH=$(find . -path "*/target/*.jar" 2>/dev/null | head -n 1)
+                # Collect all module artifacts (jar/war; exclude sources/javadoc) portable to macOS bash 3.x
+                ALL_JARS=()
+                while IFS= read -r -d '' jf; do
+                    ALL_JARS+=("$jf")
+                done < <(find . -path "*/target/*" \( -name "*.jar" -o -name "*.war" \) \
+                  ! -name "*-sources.jar" ! -name "*-javadoc.jar" -type f -print0 2>/dev/null)
+
+                # If no artifacts found and a Maven build did not run, offer to build now
+                if [ ${#ALL_JARS[@]} -eq 0 ] && [ -f "pom.xml" ] && [ "$BUILD_RAN" = false ]; then
+                    if [ "$AUTO_YES" = true ] || prompt_yes_no_default "No artifacts found. Run a quick Maven package now?" "y"; then
+                        print_message "$COLOR_CYAN" "$ICON_INFO" "Packaging modules with Maven (skip tests)..."
+                        if mvn -B -ntp -DskipTests package; then
+                            # rescan
+                            while IFS= read -r -d '' jf; do
+                                ALL_JARS+=("$jf")
+                            done < <(find . -path "*/target/*" \( -name "*.jar" -o -name "*.war" \) \
+                              ! -name "*-sources.jar" ! -name "*-javadoc.jar" -type f -print0 2>/dev/null)
+                        else
+                            print_message "$COLOR_YELLOW" "$ICON_WARNING" "Package step failed; continuing without assets."
+                        fi
+                    fi
                 fi
-                if [ -n "$BUILT_JAR_PATH" ]; then
-                    RELEASE_ARGS+=("$BUILT_JAR_PATH")
-                    print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Found JAR file to attach: $BUILT_JAR_PATH"
+
+                if [ ${#ALL_JARS[@]} -gt 0 ]; then
+                    print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Attaching ${#ALL_JARS[@]} artifact(s) to release."
+                    for jf in "${ALL_JARS[@]}"; do
+                        RELEASE_ARGS+=("$jf")
+                    done
                 else
-                    print_message "$COLOR_YELLOW" "$ICON_WARNING" "No JAR file found to attach."
+                    print_message "$COLOR_YELLOW" "$ICON_WARNING" "No build artifacts found to attach."
                 fi
             else
                 print_message "$COLOR_YELLOW" "$ICON_INFO" "Skipping JAR attachment due to --no-jar flag."
