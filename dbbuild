@@ -97,6 +97,198 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+get_current_version() {
+  if [ -f "pom.xml" ]; then
+    # Extract ONLY the <version> directly under <project>, not from <parent>
+    local PV=""
+    if command_exists xmllint; then
+      PV=$(xmllint --xpath 'string(/*[local-name()="project"]/*[local-name()="version"][1])' pom.xml 2>/dev/null || true)
+    elif command_exists xmlstarlet; then
+      PV=$(xmlstarlet sel -t -v '/*[local-name()="project"]/*[local-name()="version"][1]' pom.xml 2>/dev/null || true)
+    else
+      # Fallback parser: ignore <parent> block; stop scanning when major sections start
+      PV=$(awk '
+        BEGIN{in_parent=0; stop=0}
+        /<parent[> ]/{in_parent=1}
+        in_parent && /<\/parent>/{in_parent=0; next}
+        /<dependencies>|<build>|<dependencyManagement>|<profiles>|<modules>|<properties>/{stop=1}
+        stop==0 && !in_parent {
+          if (match($0, /<version>[[:space:]]*([^<]+)[[:space:]]*<\/[ ]*version>/, m)) { print m[1]; exit }
+        }
+      ' pom.xml)
+    fi
+    if [ -n "$PV" ]; then
+      echo "$PV"
+    elif [ -f "VERSION" ]; then
+      cat VERSION
+    else
+      echo "0.0.0"
+    fi
+  elif [ -f "VERSION" ]; then
+    cat VERSION
+  else
+    echo "0.0.0"
+  fi
+}
+
+run_tests() {
+  if [ "$SKIP_TESTS" = true ]; then
+    print_message "$COLOR_YELLOW" "$ICON_INFO" "Skipping tests due to --skip-tests flag."
+    return
+  fi
+
+  if [ -n "$CONFIG_TEST_COMMAND" ]; then
+    print_message "$COLOR_CYAN" "$ICON_INFO" "Running tests with command from .dbbuild.yml..."
+    if ! eval "$CONFIG_TEST_COMMAND"; then
+      print_message "$COLOR_RED" "$ICON_ERROR" "Tests failed. Aborting."
+      exit 1
+    fi
+    print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Tests passed."
+  elif [ -f "pom.xml" ]; then
+    print_message "$COLOR_CYAN" "$ICON_INFO" "Running tests with Maven..."
+    if ! mvn test; then
+      print_message "$COLOR_RED" "$ICON_ERROR" "Tests failed. Aborting."
+      exit 1
+    fi
+    print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Tests passed."
+  elif [ -f "package.json" ]; then
+    print_message "$COLOR_CYAN" "$ICON_INFO" "Running tests with npm..."
+    if ! npm test; then
+      print_message "$COLOR_RED" "$ICON_ERROR" "Tests failed. Aborting."
+      exit 1
+    fi
+    print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Tests passed."
+  else
+    print_message "$COLOR_YELLOW" "$ICON_INFO" "No supported test framework found. Skipping tests."
+  fi
+}
+
+setup_pre_commit_hooks() {
+  if [ -f ".pre-commit-config.yaml" ]; then
+    if ! command_exists pre-commit; then
+      print_message "$COLOR_YELLOW" "$ICON_WARNING" "pre-commit is not installed. Skipping pre-commit hook setup."
+      return
+    fi
+
+    if [ ! -d ".git/hooks" ]; then
+      print_message "$COLOR_YELLOW" "$ICON_WARNING" "Git hooks directory not found. Skipping pre-commit hook setup."
+      return
+    fi
+
+    if [ "$CONFIG_PRE_COMMIT_INSTALL" = "true" ] || { [ -z "$CONFIG_PRE_COMMIT_INSTALL" ] && { [ "$AUTO_YES" = true ] || prompt_yes_no "Set up pre-commit hooks?"; }; }; then
+      print_message "$COLOR_CYAN" "$ICON_INFO" "Setting up pre-commit hooks..."
+      if ! pre-commit install; then
+        print_message "$COLOR_RED" "$ICON_ERROR" "Failed to install pre-commit hooks."
+        exit 1
+      fi
+      print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Pre-commit hooks installed."
+    fi
+  fi
+}
+
+parse_config() {
+  if [ -f ".dbbuild.yml" ]; then
+    print_message "$COLOR_CYAN" "$ICON_INFO" "Reading configuration from .dbbuild.yml..."
+    while IFS=: read -r key value; do
+      case "$key" in
+        versioning)
+          CONFIG_VERSIONING=$(echo "$value" | xargs)
+          ;;
+        build.command)
+          CONFIG_BUILD_COMMAND=$(echo "$value" | xargs)
+          ;;
+        build.artifacts)
+          CONFIG_BUILD_ARTIFACTS+=("$(echo "$value" | xargs)")
+          ;;
+        test.command)
+          CONFIG_TEST_COMMAND=$(echo "$value" | xargs)
+          ;;
+        pre-commit.install)
+          CONFIG_PRE_COMMIT_INSTALL=$(echo "$value" | xargs)
+          ;;
+      esac
+    done < <(gawk -F: '{gsub(/[[:space:]]*- /, "", $2); print $1, $2}' .dbbuild.yml)
+  fi
+}
+
+create_release() {
+  local version=$1
+  local tag_name="v${version}"
+
+  print_message "$COLOR_BLUE" "$ICON_RELEASE" "Creating release for version ${version}..."
+
+  if git rev-parse "$tag_name" >/dev/null 2>&1; then
+    print_message "$COLOR_YELLOW" "$ICON_WARNING" "Tag '$tag_name' already exists."
+    if [ "$AUTO_YES" = true ] || prompt_yes_no "Do you want to overwrite it? (This is not recommended)"; then
+      print_message "$COLOR_CYAN" "$ICON_INFO" "Overwriting tag '$tag_name'..."
+      git tag -d "$tag_name"
+      git push --delete origin "$tag_name"
+    else
+      print_message "$COLOR_RED" "$ICON_ERROR" "Aborting. Tag not overwritten."
+      exit 1
+    fi
+  fi
+  git tag -a "$tag_name" -m "Version ${version}"
+  print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Created tag '${tag_name}'."
+
+  print_message "$COLOR_CYAN" "$ICON_INFO" "Pushing tag to remote..."
+  if git push --tags; then
+    print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Successfully pushed tag to remote."
+  else
+    print_message "$COLOR_RED" "$ICON_ERROR" "Failed to push tag to remote. Aborting."
+    exit 1
+  fi
+
+  if ! command_exists gh; then
+    print_message "$COLOR_YELLOW" "$ICON_WARNING" "gh (GitHub CLI) not found. Skipping GitHub release creation."
+    return
+  fi
+
+  if ! gh auth status > /dev/null 2>&1; then
+    print_message "$COLOR_YELLOW" "$ICON_WARNING" "Not logged into GitHub CLI."
+    if ! [ "$AUTO_YES" = true ] && prompt_yes_no "Authenticate with GitHub now?"; then
+       gh auth login
+    fi
+  fi
+
+  if gh auth status > /dev/null 2>&1; then
+    print_message "$COLOR_CYAN" "$ICON_RELEASE" "Creating GitHub release..."
+    RELEASE_ARGS=("$tag_name" --title "Release ${version}" --notes "Release version ${version}")
+    if [ "$NO_JAR" = false ]; then
+      ALL_JARS=()
+      if [ ${#CONFIG_BUILD_ARTIFACTS[@]} -gt 0 ]; then
+        for artifact in "${CONFIG_BUILD_ARTIFACTS[@]}"; do
+          while IFS= read -r -d '' jf; do
+            ALL_JARS+=("$jf")
+          done < <(find . -path "$artifact" -type f -print0 2>/dev/null)
+        done
+      else
+        while IFS= read -r -d '' jf; do
+          ALL_JARS+=("$jf")
+        done < <(find . -path "*/target/*" \( -name "*.jar" -o -name "*.war" \) \
+          ! -name "*-sources.jar" ! -name "*-javadoc.jar" -type f -print0 2>/dev/null)
+      fi
+
+      if [ ${#ALL_JARS[@]} -gt 0 ]; then
+        print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Attaching ${#ALL_JARS[@]} artifact(s) to release."
+        for jf in "${ALL_JARS[@]}"; do
+          RELEASE_ARGS+=("$jf")
+        done
+      else
+        print_message "$COLOR_YELLOW" "$ICON_WARNING" "No build artifacts found to attach."
+      fi
+    else
+      print_message "$COLOR_YELLOW" "$ICON_INFO" "Skipping JAR attachment due to --no-jar flag."
+    fi
+    if gh release create "${RELEASE_ARGS[@]}"; then
+      print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Successfully created GitHub release."
+    else
+      print_message "$COLOR_RED" "$ICON_ERROR" "Failed to create GitHub release."
+    fi
+  fi
+}
+
+
 
 # --- 📖 HELP FUNCTION 📖 ---
 
@@ -117,6 +309,7 @@ show_help() {
   printf "${COLOR_GREEN}  --no-jar             %s${COLOR_RESET}\n" "Do not attach a JAR to the GitHub release."
   printf "${COLOR_GREEN}  --skip-tests         %s${COLOR_RESET}\n" "Skip running tests during the build."
   printf "${COLOR_GREEN}  --commit-message <MSG> %s${COLOR_RESET}\n" "Use a custom commit message."
+  printf "${COLOR_GREEN}  --release            %s${COLOR_RESET}\n" "Only create a Git tag and GitHub release for the current version."
   printf "${COLOR_GREEN}  -y, --yes            %s${COLOR_RESET}\n" "Automatically answer 'yes' to all prompts."
   print_text ""
 }
@@ -132,29 +325,39 @@ NO_JAR=false
 SKIP_TESTS=false
 BUILD_RAN=false
 COMMIT_MESSAGE=""
+CONFIG_VERSIONING=""
+CONFIG_BUILD_COMMAND=""
+CONFIG_BUILD_ARTIFACTS=()
+CONFIG_TEST_COMMAND=""
+CONFIG_PRE_COMMIT_INSTALL=""
+RELEASE_ONLY=false
 
 while [[ $# -gt 0 ]]; do
   key="$1"
   case $key in
-    --help) show_help; exit 0 ;; 
-    --patch) BUMP_TYPE="patch"; shift ;; 
-    --minor) BUMP_TYPE="minor"; shift ;; 
-    --major) BUMP_TYPE="major"; shift ;; 
-    --keep-version) BUMP_TYPE="keep"; shift ;; 
-    --set-version) SET_VERSION="$2"; BUMP_TYPE="custom"; shift; shift ;; 
-    --no-build) NO_BUILD=true; shift ;; 
+    --help) show_help; exit 0 ;;
+    --patch) BUMP_TYPE="patch"; shift ;;
+    --minor) BUMP_TYPE="minor"; shift ;;
+    --major) BUMP_TYPE="major"; shift ;;
+    --keep-version) BUMP_TYPE="keep"; shift ;;
+    --set-version) SET_VERSION="$2"; BUMP_TYPE="custom"; shift; shift ;;
+    --no-build) NO_BUILD=true; shift ;;
     --no-jar) NO_JAR=true; shift ;;
     --skip-tests) SKIP_TESTS=true; shift ;;
     --commit-message) COMMIT_MESSAGE="$2"; shift; shift ;;
-    -y|--yes) AUTO_YES=true; shift ;; 
-    *) print_message "$COLOR_RED" "$ICON_ERROR" "Unknown argument: $1"; show_help; exit 1 ;; 
+    --release) RELEASE_ONLY=true; shift ;;
+    -y|--yes) AUTO_YES=true; shift ;;
+    *) print_message "$COLOR_RED" "$ICON_ERROR" "Unknown argument: $1"; show_help; exit 1 ;;
   esac
 done
 
 
 # --- 🚀 MAIN LOGIC 🚀 ---
 
-# 1. Prerequisite Checks
+main() {
+  parse_config
+
+  # 1. Prerequisite Checks
 print_message "$COLOR_BLUE" "$ICON_INFO" "Checking prerequisites..."
 if ! command_exists git; then
   print_message "$COLOR_RED" "$ICON_ERROR" "Git is not installed."
@@ -194,10 +397,17 @@ if ! git remote -v | grep -q '.'; then
     fi
 fi
 
-CURRENT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "HEAD (unborn)")
-print_message "$COLOR_GREEN" "$ICON_GIT" "Current branch: $CURRENT_BRANCH"
+  CURRENT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "HEAD (unborn)")
+  print_message "$COLOR_GREEN" "$ICON_GIT" "Current branch: $CURRENT_BRANCH"
 
-# 3. .gitignore Setup
+  if [ "$RELEASE_ONLY" = true ]; then
+    CURRENT_VERSION=$(get_current_version)
+    create_release "$CURRENT_VERSION"
+    print_message "$COLOR_GREEN" "$ICON_ROCKET" "dbbuild finished successfully!"
+    exit 0
+  fi
+
+  # 3. .gitignore Setup
 print_message "$COLOR_BLUE" "$ICON_GIT" "Setting up .gitignore..."
 setup_gitignore() {
   local gitignore_patterns=("*.yml" "*.properties")
@@ -215,54 +425,29 @@ setup_gitignore() {
 }
 setup_gitignore
 
-# 4. Versioning
+# 4. Developer Experience
+print_message "$COLOR_BLUE" "$ICON_INFO" "Setting up developer experience..."
+setup_pre_commit_hooks
+
+# 5. Versioning
 print_message "$COLOR_BLUE" "$ICON_TAG" "Handling versioning..."
-get_current_version() {
-  if [ -f "pom.xml" ]; then
-    # Extract ONLY the <version> directly under <project>, not from <parent>
-    local PV=""
-    if command_exists xmllint; then
-      PV=$(xmllint --xpath 'string(/*[local-name()="project"]/*[local-name()="version"][1])' pom.xml 2>/dev/null || true)
-    elif command_exists xmlstarlet; then
-      PV=$(xmlstarlet sel -t -v '/*[local-name()="project"]/*[local-name()="version"][1]' pom.xml 2>/dev/null || true)
-    else
-      # Fallback parser: ignore <parent> block; stop scanning when major sections start
-      PV=$(awk '
-        BEGIN{in_parent=0; stop=0}
-        /<parent[> ]/{in_parent=1}
-        in_parent && /<\/parent>/{in_parent=0; next}
-        /<dependencies>|<build>|<dependencyManagement>|<profiles>|<modules>|<properties>/{stop=1}
-        stop==0 && !in_parent {
-          if (match($0, /<version>[[:space:]]*([^<]+)[[:space:]]*<\/[ ]*version>/, m)) { print m[1]; exit }
-        }
-      ' pom.xml)
-    fi
-    if [ -n "$PV" ]; then
-      echo "$PV"
-    elif [ -f "VERSION" ]; then
-      cat VERSION
-    else
-      echo "0.0.0"
-    fi
-  elif [ -f "VERSION" ]; then
-    cat VERSION
-  else
-    echo "0.0.0"
-  fi
-}
+get_current_version
 CURRENT_VERSION=$(get_current_version)
 print_message "$COLOR_CYAN" "$ICON_INFO" "Current version: ${CURRENT_VERSION}"
 
 if [ -z "$BUMP_TYPE" ]; then
     if git rev-parse --verify HEAD >/dev/null 2>&1; then
-        COMMIT_COUNT=$(git rev-list --count HEAD...$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD))
+        COMMIT_LOG=$(git log --pretty=%B $(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)...HEAD)
     else
-        COMMIT_COUNT=0
+        COMMIT_LOG=""
     fi
     RECOMMENDATION="patch"
-    if [ "$COMMIT_COUNT" -gt 5 ]; then RECOMMENDATION="minor"; fi
-    if [ "$COMMIT_COUNT" -gt 20 ]; then RECOMMENDATION="major"; fi
-    print_message "$COLOR_YELLOW" "$ICON_INFO" "Recommendation: based on ${COMMIT_COUNT} commits, a '${RECOMMENDATION}' release is suggested."
+    if echo "$COMMIT_LOG" | grep -q "BREAKING CHANGE"; then
+        RECOMMENDATION="major"
+    elif echo "$COMMIT_LOG" | grep -q "feat"; then
+        RECOMMENDATION="minor"
+    fi
+    print_message "$COLOR_YELLOW" "$ICON_INFO" "Recommendation: based on commit history, a '${RECOMMENDATION}' release is suggested."
     printf "${COLOR_CYAN}%s${COLOR_RESET}\n" "Select the version bump:"
     printf "  1) patch\n  2) minor\n  3) major\n  4) keep current\n  5) set specific version\n"
     printf "${COLOR_CYAN}%s %s${COLOR_RESET}" "$ICON_QUESTION" "Enter your choice (1-5): "
@@ -361,11 +546,22 @@ if [ "$BUMP_TYPE" != "keep" ]; then
   update_version "$NEW_VERSION"
 fi
 
-# 5. Build Project & Update Manifests
+# 6. Run Tests
+run_tests
+
+# 7. Build Project & Update Manifests
 print_message "$COLOR_BLUE" "$ICON_BUILD" "Handling build..."
 BUILT_JAR_PATH=""
 if [ "$NO_BUILD" = true ]; then
     print_message "$COLOR_YELLOW" "$ICON_INFO" "Skipping build step due to --no-build flag."
+elif [ -n "$CONFIG_BUILD_COMMAND" ]; then
+    print_message "$COLOR_CYAN" "$ICON_INFO" "Building project with command from .dbbuild.yml..."
+    if ! eval "$CONFIG_BUILD_COMMAND"; then
+        print_message "$COLOR_RED" "$ICON_ERROR" "Build failed. Aborting."
+        exit 1
+    fi
+    BUILD_RAN=true
+    print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Build successful."
 elif [ -f "pom.xml" ]; then
     if [ "$AUTO_YES" = true ] || prompt_yes_no_default "Build project with Maven?" "y"; then
         print_message "$COLOR_CYAN" "$ICON_INFO" "Building project with Maven..."
@@ -402,11 +598,11 @@ update_cf_manifest() {
     manifest_dir=$(dirname "$manifest_file")
     local search_path="${manifest_dir}/target"
     
-    print_message "$COLOR_CYAN" "$ICON_INFO" "Searching for JAR in '$search_path'..."
+    print_message "$COLOR_CYAN" "$ICON_INFO" "Searching for JAR in '$search_path'…"
     BUILT_JAR_PATH=$(find "$search_path" -name "*.jar" 2>/dev/null | head -n 1)
 
     if [ -z "$BUILT_JAR_PATH" ]; then
-        print_message "$COLOR_YELLOW" "$ICON_WARNING" "No JAR found in '$search_path'. Searching all target directories..."
+        print_message "$COLOR_YELLOW" "$ICON_WARNING" "No JAR found in '$search_path'. Searching all target directories…"
         BUILT_JAR_PATH=$(find . -path "*/target/*.jar" 2>/dev/null | head -n 1)
     fi
 
@@ -423,7 +619,7 @@ update_cf_manifest() {
     fi
     
     print_message "$COLOR_CYAN" "$ICON_INFO" "Attempting to update manifest path..."
-    sed -i.bak -E "s|^([[:space:]]*path:).*|\\1 ${BUILT_JAR_PATH}|" "$manifest_file" && rm "${manifest_file}.bak"
+    sed -i.bak -E "s|^([[:space:]]*path:).*|\1 ${BUILT_JAR_PATH}|" "$manifest_file" && rm "${manifest_file}.bak"
     
     if [[ $(git status --porcelain "$manifest_file") ]]; then
         print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Successfully modified $manifest_file."
@@ -433,7 +629,7 @@ update_cf_manifest() {
 }
 update_cf_manifest
 
-# 6. Pre-Commit Security Scan & Git Operations
+# 8. Pre-Commit Security Scan & Git Operations
 print_message "$COLOR_BLUE" "$ICON_SHIELD" "Performing security scan and Git operations..."
 scan_for_secrets() {
   print_message "$COLOR_CYAN" "$ICON_INFO" "Scanning for potential hardcoded secrets in staged files..."
@@ -452,7 +648,8 @@ scan_for_secrets() {
     local suspicious_lines
     suspicious_lines=$(grep -iEn "$keyword_pattern\s*[:=]" "$file" | grep -viE "$safe_assignment_pattern")
     if [ -n "$suspicious_lines" ]; then
-      all_findings+="\n--- Findings in ${COLOR_CYAN}${file}${COLOR_RESET} ---\n"
+      all_findings+="\n--- Findings in ${COLOR_CYAN}${file}${COLOR_RESET} ---
+"
       all_findings+=$(echo "$suspicious_lines" | grep -iE --color=always "$keyword_pattern")
     fi
   done
@@ -488,32 +685,19 @@ if [ "$BUMP_TYPE" = "keep" ] && [ -z "$COMMIT_MESSAGE" ]; then
 fi
 
 git commit "${COMMIT_ARGS[@]}"
-
-TAG_NAME="v${NEW_VERSION}"
-if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
-    print_message "$COLOR_YELLOW" "$ICON_WARNING" "Tag '$TAG_NAME' already exists."
-    if [ "$AUTO_YES" = true ] || prompt_yes_no "Do you want to overwrite it? (This is not recommended)"; then
-        print_message "$COLOR_CYAN" "$ICON_INFO" "Overwriting tag '$TAG_NAME'..."
-        git tag -d "$TAG_NAME"
-        git push --delete origin "$TAG_NAME"
-    else
-        print_message "$COLOR_RED" "$ICON_ERROR" "Aborting. Tag not overwritten."
-        exit 1
-    fi
-fi
-git tag -a "$TAG_NAME" -m "Version ${NEW_VERSION}"
-print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Committed and tagged release."
+print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Committed release."
 
 print_message "$COLOR_CYAN" "$ICON_INFO" "Pushing to remote..."
-if git push && git push --tags; then
+if git push; then
   print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Successfully pushed to remote."
 else
   print_message "$COLOR_RED" "$ICON_ERROR" "Failed to push to remote. Aborting."
   exit 1
 fi
 
-# 7. GitHub Integration
+# 9. GitHub Integration
 print_message "$COLOR_BLUE" "$ICON_RELEASE" "Handling GitHub operations..."
+
 if ! command_exists gh; then
     print_message "$COLOR_YELLOW" "$ICON_WARNING" "gh (GitHub CLI) not found. Skipping GitHub integration."
 else
@@ -529,50 +713,12 @@ else
             gh pr create --fill --web
         fi
         if [ "$AUTO_YES" = true ] || prompt_yes_no "Create a GitHub release?"; then
-            print_message "$COLOR_CYAN" "$ICON_RELEASE" "Creating GitHub release..."
-            RELEASE_ARGS=("$TAG_NAME" --title "Release ${NEW_VERSION}" --notes "Release version ${NEW_VERSION}")
-            if [ "$NO_JAR" = false ]; then
-                # Collect all module artifacts (jar/war; exclude sources/javadoc) portable to macOS bash 3.x
-                ALL_JARS=()
-                while IFS= read -r -d '' jf; do
-                    ALL_JARS+=("$jf")
-                done < <(find . -path "*/target/*" \( -name "*.jar" -o -name "*.war" \) \
-                  ! -name "*-sources.jar" ! -name "*-javadoc.jar" -type f -print0 2>/dev/null)
-
-                # If no artifacts found and a Maven build did not run, offer to build now
-                if [ ${#ALL_JARS[@]} -eq 0 ] && [ -f "pom.xml" ] && [ "$BUILD_RAN" = false ]; then
-                    if [ "$AUTO_YES" = true ] || prompt_yes_no_default "No artifacts found. Run a quick Maven package now?" "y"; then
-                        print_message "$COLOR_CYAN" "$ICON_INFO" "Packaging modules with Maven (skip tests)..."
-                        if mvn -B -ntp -DskipTests package; then
-                            # rescan
-                            while IFS= read -r -d '' jf; do
-                                ALL_JARS+=("$jf")
-                            done < <(find . -path "*/target/*" \( -name "*.jar" -o -name "*.war" \) \
-                              ! -name "*-sources.jar" ! -name "*-javadoc.jar" -type f -print0 2>/dev/null)
-                        else
-                            print_message "$COLOR_YELLOW" "$ICON_WARNING" "Package step failed; continuing without assets."
-                        fi
-                    fi
-                fi
-
-                if [ ${#ALL_JARS[@]} -gt 0 ]; then
-                    print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Attaching ${#ALL_JARS[@]} artifact(s) to release."
-                    for jf in "${ALL_JARS[@]}"; do
-                        RELEASE_ARGS+=("$jf")
-                    done
-                else
-                    print_message "$COLOR_YELLOW" "$ICON_WARNING" "No build artifacts found to attach."
-                fi
-            else
-                print_message "$COLOR_YELLOW" "$ICON_INFO" "Skipping JAR attachment due to --no-jar flag."
-            fi
-            if gh release create "${RELEASE_ARGS[@]}"; then
-                print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Successfully created GitHub release."
-            else
-                print_message "$COLOR_RED" "$ICON_ERROR" "Failed to create GitHub release."
-            fi
+            create_release "$NEW_VERSION"
         fi
     fi
 fi
 
 print_message "$COLOR_GREEN" "$ICON_ROCKET" "dbbuild finished successfully!"
+}
+
+main

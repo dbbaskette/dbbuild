@@ -11,7 +11,9 @@
 ## ✨ Features
 
 - **Interactive & Non-Interactive Modes:** Run in a fully interactive mode that prompts you for each step, or use flags (`--patch`, `--yes`, etc.) for CI/CD automation.
-- **Smart Versioning:** Automatically detects the current version from `pom.xml` or a `VERSION` file and recommends a version bump (patch, minor, major) based on commit history.
+- **Smart Versioning:** Automatically detects the current version from `pom.xml` or a `VERSION` file and recommends a version bump (patch, minor, major) based on Conventional Commits history (`feat`, `BREAKING CHANGE`).
+- **Configuration File:** Supports a `.dbbuild.yml` file to define custom build commands, test commands, and release artifacts.
+- **Automated Testing:** Automatically runs tests (`mvn test` or `npm test`) before building to ensure code quality.
 - **Flexible Build System:**
     - Automatically builds Java projects using Maven if a `pom.xml` is detected.
     - Allows skipping the build step entirely for script-only or documentation repositories (`--no-build`).
@@ -20,6 +22,7 @@
     - Automatically commits version file changes with a conventional commit message.
     - Creates a Git tag for the new version.
     - Pushes the commit and tags to your remote repository.
+- **Pre-commit Hook Integration:** Detects `.pre-commit-config.yaml` and offers to install hooks to maintain code standards.
 - **GitHub Integration:**
     - Prompts to authenticate with the `gh` CLI if not already logged in.
     - Offers to create a GitHub Pull Request for the new version.
@@ -35,6 +38,7 @@ Before using `dbbuild`, please ensure the following tools are installed and avai
 - **`git`**: For all version control operations.
 - **`gh`**: The official GitHub CLI, required for creating Pull Requests and Releases.
 - **`mvn`**: Apache Maven, required for building Java-based projects with a `pom.xml`.
+- **`pre-commit`** (optional): For installing pre-commit hooks if a `.pre-commit-config.yaml` is present.
 
 ---
 
@@ -80,7 +84,47 @@ You can use the following flags to run the script in a non-interactive or pre-co
 | `--major`    | Automatically set the version bump to **major**.   |
 | `--no-build` | Skip the build step entirely.                  |
 | `--no-jar`   | Do not attach a JAR to the GitHub release.     |
+| `--skip-tests` | Skip running automated tests.                |
+| `--release`  | Only create a Git tag and GitHub release.      |
 | `-y`, `--yes`  | Automatically answer 'yes' to all prompts.     |
+
+### Workflow Examples
+
+#### Full Release (Interactive)
+This is the most common use case. The script will guide you through bumping the version, testing, building, and releasing.
+```bash
+dbbuild
+```
+
+#### Automated Patch Release
+To automate a patch release (e.g., in a CI/CD pipeline), use the `--patch` and `--yes` flags. This will perform the full workflow without any prompts.
+```bash
+dbbuild --patch --yes
+```
+
+#### Release-Only
+If your build and tests are handled by a separate process, you can use `dbbuild` to handle only the final release steps (Git tag and GitHub Release).
+```bash
+dbbuild --release
+```
+
+### Configuration File
+
+For more advanced automation, you can create a `.dbbuild.yml` file in your project's root directory to customize the behavior of `dbbuild`.
+
+**Example `.dbbuild.yml`:**
+
+```yaml
+versioning: semantic # 'semantic' or 'commit-count'
+build:
+  command: ./gradlew build
+  artifacts:
+    - "build/libs/*.jar"
+test:
+  command: ./gradlew test
+pre-commit:
+  install: true # 'true' or 'false'
+```
 
 ---
 
