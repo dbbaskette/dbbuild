@@ -39,6 +39,7 @@ Before using `dbbuild`, please ensure the following tools are installed and avai
 - **`gh`**: The official GitHub CLI, required for creating Pull Requests and Releases.
 - **`mvn`**: Apache Maven, required for building Java-based projects with a `pom.xml`.
 - **`pre-commit`** (optional): For installing pre-commit hooks if a `.pre-commit-config.yaml` is present.
+- **`cf`** (optional): The Cloud Foundry CLI, required for deploying with the `--cf` flag.
 
 ---
 
@@ -86,6 +87,7 @@ You can use the following flags to run the script in a non-interactive or pre-co
 | `--no-jar`   | Do not attach a JAR to the GitHub release.     |
 | `--skip-tests` | Skip running automated tests.                |
 | `--release`  | Only create a Git tag and GitHub release.      |
+| `--cf`       | Deploy the application to Cloud Foundry.       |
 | `-y`, `--yes`  | Automatically answer 'yes' to all prompts.     |
 
 ### Workflow Examples
@@ -106,6 +108,12 @@ dbbuild --patch --yes
 If your build and tests are handled by a separate process, you can use `dbbuild` to handle only the final release steps (Git tag and GitHub Release).
 ```bash
 dbbuild --release
+```
+
+#### Automated Deployment to Cloud Foundry
+To run the full workflow and then deploy your application to Cloud Foundry, use the `--cf` flag.
+```bash
+dbbuild --patch --yes --cf
 ```
 
 ### Configuration File

@@ -288,6 +288,51 @@ create_release() {
   fi
 }
 
+deploy_to_cf() {
+  local version=$1
+  print_message "$COLOR_BLUE" "$ICON_CF" "Deploying to Cloud Foundry..."
+
+  local manifest_file=""
+  if [ -f "manifest.yml" ]; then manifest_file="manifest.yml"; fi
+  if [ -f "manifest.yaml" ]; then manifest_file="manifest.yaml"; fi
+  if [ -z "$manifest_file" ]; then
+    print_message "$COLOR_YELLOW" "$ICON_WARNING" "No Cloud Foundry manifest found. Skipping deployment."
+    return
+  fi
+
+  # Update app name with version
+  local base_app_name=$(grep -E '^\s*name:' "$manifest_file" | sed -E 's/^\s*name:\s*//' | sed 's/"//g' | awk '{print $1}')
+  local new_app_name="${base_app_name}-v${version}"
+  print_message "$COLOR_CYAN" "$ICON_INFO" "Updating app name in manifest to: ${new_app_name}"
+  sed -i.bak -E "s|name:.*|name: ${new_app_name}|" "$manifest_file" && rm "${manifest_file}.bak"
+
+  # Update manifest path (re-run the existing logic to find the JAR)
+  update_cf_manifest
+
+  if ! command_exists cf; then
+    print_message "$COLOR_RED" "$ICON_ERROR" "Cloud Foundry CLI (cf) is not installed. Cannot deploy."
+    exit 1
+  fi
+
+  if ! cf api > /dev/null 2>&1; then
+    print_message "$COLOR_YELLOW" "$ICON_WARNING" "Not logged into Cloud Foundry."
+    if [ "$AUTO_YES" = true ] || prompt_yes_no "Log in to Cloud Foundry now?"; then
+      cf login
+    else
+      print_message "$COLOR_RED" "$ICON_ERROR" "Cannot deploy without being logged in. Aborting."
+      exit 1
+    fi
+  fi
+
+  print_message "$COLOR_CYAN" "$ICON_INFO" "Pushing application to Cloud Foundry..."
+  if cf push; then
+    print_message "$COLOR_GREEN" "$ICON_SUCCESS" "Successfully deployed to Cloud Foundry."
+  else
+    print_message "$COLOR_RED" "$ICON_ERROR" "Cloud Foundry deployment failed."
+    exit 1
+  fi
+}
+
 
 
 # --- 📖 HELP FUNCTION 📖 ---
@@ -310,6 +355,7 @@ show_help() {
   printf "${COLOR_GREEN}  --skip-tests         %s${COLOR_RESET}\n" "Skip running tests during the build."
   printf "${COLOR_GREEN}  --commit-message <MSG> %s${COLOR_RESET}\n" "Use a custom commit message."
   printf "${COLOR_GREEN}  --release            %s${COLOR_RESET}\n" "Only create a Git tag and GitHub release for the current version."
+  printf "${COLOR_GREEN}  --cf                 %s${COLOR_RESET}\n" "Build, update manifest, and push to Cloud Foundry."
   printf "${COLOR_GREEN}  -y, --yes            %s${COLOR_RESET}\n" "Automatically answer 'yes' to all prompts."
   print_text ""
 }
@@ -331,6 +377,7 @@ CONFIG_BUILD_ARTIFACTS=()
 CONFIG_TEST_COMMAND=""
 CONFIG_PRE_COMMIT_INSTALL=""
 RELEASE_ONLY=false
+CF_DEPLOY=false
 
 while [[ $# -gt 0 ]]; do
   key="$1"
@@ -346,6 +393,7 @@ while [[ $# -gt 0 ]]; do
     --skip-tests) SKIP_TESTS=true; shift ;;
     --commit-message) COMMIT_MESSAGE="$2"; shift; shift ;;
     --release) RELEASE_ONLY=true; shift ;;
+    --cf) CF_DEPLOY=true; shift ;;
     -y|--yes) AUTO_YES=true; shift ;;
     *) print_message "$COLOR_RED" "$ICON_ERROR" "Unknown argument: $1"; show_help; exit 1 ;;
   esac
@@ -716,6 +764,10 @@ else
             create_release "$NEW_VERSION"
         fi
     fi
+fi
+
+if [ "$CF_DEPLOY" = true ]; then
+  deploy_to_cf "$NEW_VERSION"
 fi
 
 print_message "$COLOR_GREEN" "$ICON_ROCKET" "dbbuild finished successfully!"
