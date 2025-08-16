@@ -265,7 +265,7 @@ create_release() {
       else
         while IFS= read -r -d '' jf; do
           ALL_JARS+=("$jf")
-        done < <(find . -path "*/target/*" \( -name "*.jar" -o -name "*.war" \) \
+        done < <(find . -path "./target/*" \( -name "*.jar" -o -name "*.war" \) \
           ! -name "*-sources.jar" ! -name "*-javadoc.jar" -type f -print0 2>/dev/null)
       fi
 
